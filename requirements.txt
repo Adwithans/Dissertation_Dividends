@@ -1,0 +1,4 @@
+eikon
+python-dotenv
+.env
+refinitiv-data

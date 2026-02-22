@@ -1,0 +1,25 @@
+{
+    "logs": {
+        "level": "debug",
+        "transports": {
+            "console": {
+                "enabled": false
+            },
+            "file": {
+                "enabled": false,
+                "name": "refinitiv-data-lib.log"
+            }
+        }
+    },
+    "sessions": {
+        "default": "desktop.workspace",
+        "platform": {
+            "rdp": {
+                "app-key": "46f945884fa541838b7049425aa1132805187f9e",
+                "username": "adwit.hans.23@ucl.ac.uk",
+                "password": "UCL@2025"
+            }
+        }
+        
+    }
+}
