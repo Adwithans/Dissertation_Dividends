@@ -1,4 +1,9 @@
 eikon
 python-dotenv
-.env
 refinitiv-data
+pandas
+numpy
+matplotlib
+PyYAML
+pytest
+pyarrow

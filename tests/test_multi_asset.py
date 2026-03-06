@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from datetime import date
+
+import pandas as pd
+
+from src.dividend_portfolio.models import (
+    AssetConfig,
+    PortfolioConfig,
+    QuarterlyMetricsConfig,
+    RebalanceConfig,
+)
+from src.dividend_portfolio.sim.multi_asset import simulate_portfolio
+
+
+def _history(prices: list[float], dates: list[str]) -> pd.DataFrame:
+    idx = pd.to_datetime(dates)
+    return pd.DataFrame(
+        {
+            "CLOSE": prices,
+            "Dividend": [0.0] * len(prices),
+            "SplitFactor": [1.0] * len(prices),
+            "cum_factor": [1.0] * len(prices),
+        },
+        index=idx,
+    )
+
+
+def test_multi_asset_aggregation_identity() -> None:
+    dates = ["2024-01-02", "2024-01-03", "2024-01-04"]
+    histories = {
+        "AAPL.O": _history([100.0, 102.0, 104.0], dates),
+        "MSFT.O": _history([50.0, 51.0, 52.0], dates),
+    }
+
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=None,
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=False,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.02,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("AAPL.O", 0.5), AssetConfig("MSFT.O", 0.5)],
+    )
+
+    sim = simulate_portfolio(histories, cfg)
+    p = sim.portfolio_df
+
+    summed = sim.asset_results["AAPL.O"]["Market_Value"] + sim.asset_results["MSFT.O"]["Market_Value"]
+    assert (summed.round(8) == p["Portfolio_Market_Value"].round(8)).all()

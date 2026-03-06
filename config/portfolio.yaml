@@ -1,0 +1,55 @@
+base_currency: USD
+initial_capital: 1000000
+start_date: 2011-02-16
+end_date: null
+reinvest_dividends: false
+auto_align_splits: true
+use_cum_factor: true
+risk_free_rate: 0.02
+rebalancing:
+  enabled: True
+  frequency: quarterly
+  # Rebalance at the first available trading day after quarter-end.
+  trigger: first_trading_day_after_quarter_end
+  # Skip tiny trades unless weights drift at least this absolute amount.
+  drift_tolerance: 0.02
+quarterly_metrics:
+  enabled: true
+  # Dividend return per stock per quarter:
+  # dividends_received_in_quarter / market_value_at_quarter_start
+  dividend_return_basis: quarter_start_market_value
+assets:
+  - ric: NVDA.O
+    weight: 0.125
+  - ric: AAPL.O
+    weight: 0.125
+  - ric: MSFT.O
+    weight: 0.125
+  - ric: JNJ.N
+    weight: 0.125
+  - ric: PG.N
+    weight: 0.125
+  - ric: V.N
+    weight: 0.125
+  - ric: JPM.N
+    weight: 0.125
+  - ric: XOM.N
+    weight: 0.125
+
+strategy:
+  mode: dynamic_100_25
+  universe_scope: sp500
+  candidate_count: 100
+  portfolio_size: 25
+  dividend_payer_lookback: 12
+  selection_metric: quarter_dividend_yield
+  yield_denominator: quarter_average_close
+  rebalance_timing: first_trading_day_after_quarter_end
+  initial_selection: market_cap
+  initial_weighting: market_cap
+  quarterly_weighting: normalized_yield_score
+  missing_data_policy: backfill_next_ranked
+  sqlite_path: data/store/portfolio_100.sqlite
+  parquet_dir: data/store/parquet
+  parquet_enabled: true
+  csv_export_enabled: false

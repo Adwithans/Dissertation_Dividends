@@ -1,0 +1,6 @@
+ric,dividend_event_count,market_cap_points,first_market_cap_date,last_market_cap_date,market_cap_source,dividend_source,notes
+HUM.N,4,12,2024-01-31,2024-12-31,eikon,eikon,
+IBM.N,4,12,2024-01-31,2024-12-31,eikon,eikon,
+JCI.N,4,12,2024-01-31,2024-12-31,eikon,eikon,
+APD.N,3,12,2024-01-31,2024-12-31,eikon,eikon,
+A.N,4,12,2024-01-31,2024-12-31,eikon,eikon,

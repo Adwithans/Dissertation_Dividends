@@ -1,0 +1,11 @@
+ric,dividend_event_count,market_cap_points,first_market_cap_date,last_market_cap_date,market_cap_source,dividend_source,notes
+HUM.N,59,192,2010-01-29,2025-12-31,eikon,eikon,
+IBM.N,64,192,2010-01-29,2025-12-31,eikon,eikon,
+JCI.N,65,192,2010-01-29,2025-12-31,eikon,eikon,
+APD.N,63,192,2010-01-29,2025-12-31,eikon,eikon,
+A.N,55,192,2010-01-29,2025-12-31,eikon,eikon,
+SW.N,6,192,2010-01-29,2025-12-31,eikon,eikon,
+LVS.N,44,192,2010-01-29,2025-12-31,eikon,eikon,
+CBRE.N,0,192,2010-01-29,2025-12-31,eikon,eikon,
+HAS.OQ,64,192,2010-01-29,2025-12-31,eikon,eikon,
+ECL.N,64,192,2010-01-29,2025-12-31,eikon,eikon,
