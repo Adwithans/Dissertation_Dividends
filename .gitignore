@@ -1,5 +1,7 @@
 .venv/
+.venv-refinitiv/
 .env
 .venv-refinitiv
 __pycache__/
-data/runs/
+data/
+
