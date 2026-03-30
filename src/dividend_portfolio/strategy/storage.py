@@ -81,6 +81,18 @@ class StrategyStore:
                 price REAL,
                 trade_shares REAL,
                 trade_value REAL,
+                reference_price REAL,
+                execution_price REAL,
+                bid_price REAL,
+                ask_price REAL,
+                gross_notional REAL,
+                spread_bps_used REAL,
+                slippage_bps_used REAL,
+                commission_cost REAL,
+                slippage_cost REAL,
+                spread_cost REAL,
+                total_transaction_cost REAL,
+                net_cash_flow REAL,
                 reason TEXT NOT NULL,
                 PRIMARY KEY (run_id, date, quarter, ric)
             );
@@ -107,13 +119,55 @@ class StrategyStore:
                 portfolio_market_value REAL,
                 portfolio_cash_balance REAL,
                 portfolio_total_value REAL,
+                portfolio_total_value_gross REAL,
                 portfolio_dividend_cash_daily REAL,
+                portfolio_transaction_cost_daily REAL,
+                portfolio_commission_cost_daily REAL,
+                portfolio_slippage_cost_daily REAL,
+                portfolio_spread_cost_daily REAL,
+                portfolio_transaction_cost_cumulative REAL,
                 rebalance_flag INTEGER NOT NULL,
                 PRIMARY KEY (run_id, date)
             );
             """
         )
+        self._ensure_columns(
+            "trades",
+            {
+                "reference_price": "REAL",
+                "execution_price": "REAL",
+                "bid_price": "REAL",
+                "ask_price": "REAL",
+                "gross_notional": "REAL",
+                "spread_bps_used": "REAL",
+                "slippage_bps_used": "REAL",
+                "commission_cost": "REAL",
+                "slippage_cost": "REAL",
+                "spread_cost": "REAL",
+                "total_transaction_cost": "REAL",
+                "net_cash_flow": "REAL",
+            },
+        )
+        self._ensure_columns(
+            "portfolio_daily",
+            {
+                "portfolio_total_value_gross": "REAL",
+                "portfolio_transaction_cost_daily": "REAL",
+                "portfolio_commission_cost_daily": "REAL",
+                "portfolio_slippage_cost_daily": "REAL",
+                "portfolio_spread_cost_daily": "REAL",
+                "portfolio_transaction_cost_cumulative": "REAL",
+            },
+        )
         self.conn.commit()
+
+    def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        existing = {
+            str(row[1]) for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for col, col_type in columns.items():
+            if col not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
     def run_exists(self, run_id: str) -> bool:
         cur = self.conn.execute(
@@ -238,13 +292,41 @@ class StrategyStore:
     def upsert_trades(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
-        rows = self._to_records(df)
+        out = df.copy()
+        default_cols: dict[str, Any] = {
+            "reference_price": None,
+            "execution_price": None,
+            "bid_price": None,
+            "ask_price": None,
+            "gross_notional": None,
+            "spread_bps_used": 0.0,
+            "slippage_bps_used": 0.0,
+            "commission_cost": 0.0,
+            "slippage_cost": 0.0,
+            "spread_cost": 0.0,
+            "total_transaction_cost": 0.0,
+            "net_cash_flow": None,
+        }
+        for col, default in default_cols.items():
+            if col not in out.columns:
+                out[col] = default
+        if "reason" not in out.columns:
+            out["reason"] = "quarterly_rotation"
+        rows = self._to_records(out)
         self.conn.executemany(
             """
             INSERT OR REPLACE INTO trades (
-                run_id, date, quarter, ric, price, trade_shares, trade_value, reason
+                run_id, date, quarter, ric, price, trade_shares, trade_value,
+                reference_price, execution_price, bid_price, ask_price,
+                gross_notional, spread_bps_used, slippage_bps_used,
+                commission_cost, slippage_cost, spread_cost, total_transaction_cost,
+                net_cash_flow, reason
             ) VALUES (
-                :run_id, :date, :quarter, :ric, :price, :trade_shares, :trade_value, :reason
+                :run_id, :date, :quarter, :ric, :price, :trade_shares, :trade_value,
+                :reference_price, :execution_price, :bid_price, :ask_price,
+                :gross_notional, :spread_bps_used, :slippage_bps_used,
+                :commission_cost, :slippage_cost, :spread_cost, :total_transaction_cost,
+                :net_cash_flow, :reason
             )
             """,
             rows,
@@ -272,15 +354,35 @@ class StrategyStore:
     def upsert_portfolio_daily(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
-        rows = self._to_records(df)
+        out = df.copy()
+        default_cols: dict[str, Any] = {
+            "portfolio_total_value_gross": out.get("portfolio_total_value"),
+            "portfolio_transaction_cost_daily": 0.0,
+            "portfolio_commission_cost_daily": 0.0,
+            "portfolio_slippage_cost_daily": 0.0,
+            "portfolio_spread_cost_daily": 0.0,
+            "portfolio_transaction_cost_cumulative": 0.0,
+        }
+        for col, default in default_cols.items():
+            if col not in out.columns:
+                out[col] = default
+        rows = self._to_records(out)
         self.conn.executemany(
             """
             INSERT OR REPLACE INTO portfolio_daily (
                 run_id, date, quarter, portfolio_market_value, portfolio_cash_balance,
-                portfolio_total_value, portfolio_dividend_cash_daily, rebalance_flag
+                portfolio_total_value, portfolio_total_value_gross,
+                portfolio_dividend_cash_daily, portfolio_transaction_cost_daily,
+                portfolio_commission_cost_daily, portfolio_slippage_cost_daily,
+                portfolio_spread_cost_daily, portfolio_transaction_cost_cumulative,
+                rebalance_flag
             ) VALUES (
                 :run_id, :date, :quarter, :portfolio_market_value, :portfolio_cash_balance,
-                :portfolio_total_value, :portfolio_dividend_cash_daily, :rebalance_flag
+                :portfolio_total_value, :portfolio_total_value_gross,
+                :portfolio_dividend_cash_daily, :portfolio_transaction_cost_daily,
+                :portfolio_commission_cost_daily, :portfolio_slippage_cost_daily,
+                :portfolio_spread_cost_daily, :portfolio_transaction_cost_cumulative,
+                :rebalance_flag
             )
             """,
             rows,

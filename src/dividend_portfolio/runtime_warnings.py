@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import warnings
 
+import pandas as pd
+
 
 def configure_runtime_warning_filters() -> None:
     # Eikon emits this internally; we can't change third-party code in site-packages.
     warnings.filterwarnings(
         "ignore",
         message=r"errors='ignore' is deprecated and will raise in a future version\..*",
+        category=FutureWarning,
+        module=r"eikon\.data_grid",
+    )
+    warnings.filterwarnings(
+        "ignore",
         category=FutureWarning,
         module=r"eikon\.data_grid",
     )
@@ -18,3 +25,19 @@ def configure_runtime_warning_filters() -> None:
         category=FutureWarning,
         module=r"refinitiv\.data\._tools\._dataframe",
     )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Downcasting object dtype arrays on \.fillna, \.ffill, \.bfill is deprecated and will change in a future version\..*",
+        category=FutureWarning,
+        module=r"refinitiv\.data\._tools\._dataframe",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        module=r"refinitiv\.data\._tools\._dataframe",
+    )
+    try:
+        pd.set_option("future.no_silent_downcasting", True)
+    except Exception:  # noqa: BLE001
+        # Older pandas versions may not have this option.
+        pass

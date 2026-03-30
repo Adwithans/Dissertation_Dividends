@@ -6,6 +6,14 @@ reinvest_dividends: false
 auto_align_splits: true
 use_cum_factor: true
 risk_free_rate: 0.02
+transaction_costs:
+  enabled: true
+  commission_bps: 2.0
+  commission_min_usd: 1.0
+  slippage_bps_per_side: 3.0
+  fallback_full_spread_bps: 10.0
+  use_bid_ask_when_available: true
+  sizing_rule: cost_aware_scaling
 rebalancing:
   enabled: True
   frequency: quarterly
@@ -18,25 +26,26 @@ quarterly_metrics:
   # Dividend return per stock per quarter:
   # dividends_received_in_quarter / market_value_at_quarter_start
   dividend_return_basis: quarter_start_market_value
-assets:
-  - ric: NVDA.O
-    weight: 0.125
-  - ric: AAPL.O
-    weight: 0.125
-  - ric: MSFT.O
-    weight: 0.125
-  - ric: JNJ.N
-    weight: 0.125
-  - ric: PG.N
-    weight: 0.125
-  - ric: V.N
-    weight: 0.125
-  - ric: JPM.N
-    weight: 0.125
-  - ric: XOM.N
-    weight: 0.125
 
+
+
+
+# change the number of stocks selected each quarter: 
 strategy:
+  selection_policy:
+    name: replace_bottom_n
+    max_replacements_per_quarter: 12
+    rank_metric: quarter_dividend_yield_score
+  experiment_group: realloc_compare
+
+# change the number of times we rebalance (not quarterly)
+# strategy:
+#   rebalance_interval_quarters: 4
+#   selection_policy:
+#     name: replace_bottom_n
+#     rank_metric: quarter_dividend_yield_score
+#   experiment_group: realloc_frequency
+
   mode: dynamic_100_25
   universe_scope: sp500
   candidate_count: 100
@@ -47,7 +56,7 @@ strategy:
   rebalance_timing: first_trading_day_after_quarter_end
   initial_selection: market_cap
   initial_weighting: market_cap
-  quarterly_weighting: normalized_yield_score
+  allocation_strategy: yield_proportional
   missing_data_policy: backfill_next_ranked
   sqlite_path: data/store/portfolio_100.sqlite
   parquet_dir: data/store/parquet

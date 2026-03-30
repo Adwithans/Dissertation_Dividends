@@ -90,9 +90,12 @@ def compute_quarter_dividend_yield_scores(
     out["DividendSumPS"] = out["DividendSumPS"].fillna(0.0)
     out["AvgClose"] = pd.to_numeric(out["CloseDenominator"], errors="coerce")
     out = out.drop(columns=["CloseDenominator"])
-    out["Score"] = 0.0
+    out["Score"] = pd.Series(0.0, index=out.index, dtype=float)
     mask = out["AvgClose"] > 0
-    out.loc[mask, "Score"] = out.loc[mask, "DividendSumPS"] / out.loc[mask, "AvgClose"]
+    out.loc[mask, "Score"] = (
+        pd.to_numeric(out.loc[mask, "DividendSumPS"], errors="coerce").astype(float)
+        / pd.to_numeric(out.loc[mask, "AvgClose"], errors="coerce").astype(float)
+    ).astype(float)
     out = _stable_desc_rank(out, "Score", "RankByScore")
     return out[["RIC", "AvgClose", "DividendSumPS", "Score", "RankByScore"]]
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from ..config import load_portfolio_config
 from ..models import StrategyConfig
 from ..reporting.dynamic_results import generate_dynamic_showresults
+from .run_dynamic_strategy import _normalize_experiment_group, _upsert_experiment_comparison
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +29,11 @@ def parse_args() -> argparse.Namespace:
         default="S&P 500 (.SPX)",
         help="Display label used in chart/summary benchmark section",
     )
+    parser.add_argument(
+        "--experiment-group",
+        default=None,
+        help="Optional experiment group name for writing cross-run comparison tables.",
+    )
     return parser.parse_args()
 
 
@@ -35,6 +42,9 @@ def main() -> None:
     cfg = load_portfolio_config(args.config)
     strategy = cfg.strategy or StrategyConfig(mode="dynamic_100_25")
     db_path = args.db_path or strategy.sqlite_path
+    experiment_group = _normalize_experiment_group(args.experiment_group) or _normalize_experiment_group(
+        strategy.experiment_group
+    )
 
     run_id, out_dir = generate_dynamic_showresults(
         db_path=db_path,
@@ -47,9 +57,18 @@ def main() -> None:
 
     print(f"[OK] showresults generated for run_id={run_id}")
     print(f"[INFO] Output directory: {Path(out_dir)}")
-    print(f"[INFO] Summary JSON: {Path(out_dir) / 'summary.json'}")
+    summary_path = Path(out_dir) / "summary.json"
+    print(f"[INFO] Summary JSON: {summary_path}")
+    if experiment_group:
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+        csv_path, json_path = _upsert_experiment_comparison(
+            summary=summary,
+            experiment_group=experiment_group,
+        )
+        print(f"[OK] Experiment comparison updated: {csv_path}")
+        print(f"[INFO] Experiment comparison JSON: {json_path}")
 
 
 if __name__ == "__main__":
     main()
-

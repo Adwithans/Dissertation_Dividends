@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from .fetch_histories import run_fetch_histories
-from .run_backtest import run_backtest
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,24 +20,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
-
-    run_fetch_histories(
-        config_path=args.config,
-        output_dir=args.history_dir,
-        start_date_override=args.start_date,
-        end_date_override=args.end_date,
+    _ = parse_args()
+    raise RuntimeError(
+        "Static pipeline has been retired. "
+        "Run dynamic strategy directly: "
+        "`python -m src.dividend_portfolio.cli.run_dynamic_strategy --config config/portfolio.yaml`."
     )
-
-    run_dir = run_backtest(
-        config_path=args.config,
-        history_dir=args.history_dir,
-        fallback_history_dir=None,
-        run_base_dir=args.run_base_dir,
-        generate_plots=not args.no_plots,
-    )
-
-    print(f"[OK] Pipeline complete. Outputs at: {Path(run_dir)}")
 
 
 if __name__ == "__main__":

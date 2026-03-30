@@ -46,11 +46,57 @@ def test_sqlite_schema_idempotent_insert_and_csv_export_parity(tmp_path: Path) -
     )
     assert int(count_df.iloc[0]["n"]) == 1
 
+    trade_df = pd.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "date": "2024-01-02",
+                "quarter": "2024Q1",
+                "ric": "A",
+                "price": 100.0,
+                "trade_shares": 1.0,
+                "trade_value": 100.0,
+                "reason": "test_trade",
+            }
+        ]
+    )
+    store.upsert_trades(trade_df)
+
+    portfolio_df = pd.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "date": "2024-01-02",
+                "quarter": "2024Q1",
+                "portfolio_market_value": 100.0,
+                "portfolio_cash_balance": 0.0,
+                "portfolio_total_value": 100.0,
+                "portfolio_dividend_cash_daily": 0.0,
+                "rebalance_flag": 1,
+            }
+        ]
+    )
+    store.upsert_portfolio_daily(portfolio_df)
+
+    trade_cols = {
+        row[1] for row in store.conn.execute("PRAGMA table_info(trades)").fetchall()
+    }
+    assert "total_transaction_cost" in trade_cols
+    assert "execution_price" in trade_cols
+    pcols = {
+        row[1] for row in store.conn.execute("PRAGMA table_info(portfolio_daily)").fetchall()
+    }
+    assert "portfolio_transaction_cost_daily" in pcols
+    assert "portfolio_total_value_gross" in pcols
+
     out_dir = tmp_path / "exports"
     store.export_run_csv(run_id, out_dir)
     exported = pd.read_csv(out_dir / "candidate_universe.csv")
     assert len(exported) == 1
     assert exported.iloc[0]["ric"] == "A"
+    exported_trades = pd.read_csv(out_dir / "trades.csv")
+    assert "total_transaction_cost" in exported_trades.columns
+    assert float(exported_trades["total_transaction_cost"].iloc[0]) == 0.0
     assert store.row_count("candidate_universe", run_id) == 1
 
     store.close()

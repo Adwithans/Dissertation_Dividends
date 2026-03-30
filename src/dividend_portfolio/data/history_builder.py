@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .fetch_events import fetch_dividend_events, fetch_split_events
-from .fetch_prices import fetch_prices
+from .fetch_prices import fetch_bid_ask, fetch_prices
 from .refinitiv_client import RefinitivClient
 
 
@@ -16,12 +16,15 @@ def build_history_for_ticker(
     prices = fetch_prices(client, ticker, start_dt, end_dt)
     if prices is None or prices.empty:
         return None
+    bid_ask = fetch_bid_ask(client, ticker, start_dt, end_dt)
 
     div_series, _ = fetch_dividend_events(client, ticker, start_dt, end_dt)
     split_series, _ = fetch_split_events(client, ticker, start_dt, end_dt)
 
     data = prices.join(div_series, how="left")
     data = data.join(split_series, how="left")
+    if bid_ask is not None and not bid_ask.empty:
+        data = data.join(bid_ask, how="left")
 
     if "CLOSE" not in data.columns:
         close_col = next((c for c in data.columns if c.upper() == "CLOSE"), None)
@@ -48,7 +51,12 @@ def build_history_for_ticker(
     split_mult = sf.where(sf >= 1.0, 1.0 / sf)
     data["cum_factor"] = split_mult.cumprod()
 
-    return data[["CLOSE", "Dividend", "SplitFactor", "CumulativeDividend", "cum_factor"]]
+    if "BID" not in data.columns:
+        data["BID"] = pd.NA
+    if "ASK" not in data.columns:
+        data["ASK"] = pd.NA
+
+    return data[["CLOSE", "BID", "ASK", "Dividend", "SplitFactor", "CumulativeDividend", "cum_factor"]]
 
 
 def build_histories_for_tickers(

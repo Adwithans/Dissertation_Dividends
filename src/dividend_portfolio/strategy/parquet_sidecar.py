@@ -52,3 +52,6 @@ class ParquetSidecarWriter:
 
     def write_dividends(self, df: pd.DataFrame, quarter: str) -> None:
         self._write(df, "dividends", quarter, date_col="Date")
+
+    def write_bid_ask(self, df: pd.DataFrame, quarter: str) -> None:
+        self._write(df, "bid_ask", quarter, date_col="Date")

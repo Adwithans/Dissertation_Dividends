@@ -11,7 +11,9 @@ from .models import (
     PortfolioConfig,
     QuarterlyMetricsConfig,
     RebalanceConfig,
+    SelectionPolicyConfig,
     StrategyConfig,
+    TransactionCostsConfig,
 )
 
 
@@ -40,6 +42,14 @@ def _parse_date(value: Any, field_name: str) -> date | None:
         return date.fromisoformat(str(value))
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Invalid ISO date for '{field_name}': {value}") from exc
+
+
+def _normalize_allocation_strategy(value: Any, *, field_name: str) -> str:
+    normalized = str(value).strip().lower()
+    alias_map = {
+        "normalized_yield_score": "yield_proportional",
+    }
+    return alias_map.get(normalized, normalized)
 
 
 def load_portfolio_config(path: str | Path) -> PortfolioConfig:
@@ -96,8 +106,214 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
             "quarterly_metrics.dividend_return_basis must be 'quarter_start_market_value'"
         )
 
-    assets_raw = _require(data, "assets")
-    if not isinstance(assets_raw, list) or not assets_raw:
+    tx_raw = data.get("transaction_costs", {})
+    if tx_raw is None:
+        tx_raw = {}
+    if not isinstance(tx_raw, dict):
+        raise ValueError("transaction_costs must be an object")
+
+    tx_enabled = bool(tx_raw.get("enabled", False))
+    tx_commission_bps = float(tx_raw.get("commission_bps", 1.0))
+    tx_commission_min = float(tx_raw.get("commission_min_usd", 1.0))
+    tx_slippage_bps = float(tx_raw.get("slippage_bps_per_side", 2.0))
+    tx_fallback_spread_bps = float(tx_raw.get("fallback_full_spread_bps", 5.0))
+    tx_use_bid_ask = bool(tx_raw.get("use_bid_ask_when_available", True))
+    tx_sizing_rule = str(tx_raw.get("sizing_rule", "cost_aware_scaling")).strip().lower()
+
+    if tx_commission_bps < 0:
+        raise ValueError("transaction_costs.commission_bps must be >= 0")
+    if tx_commission_min < 0:
+        raise ValueError("transaction_costs.commission_min_usd must be >= 0")
+    if tx_slippage_bps < 0:
+        raise ValueError("transaction_costs.slippage_bps_per_side must be >= 0")
+    if tx_fallback_spread_bps < 0:
+        raise ValueError("transaction_costs.fallback_full_spread_bps must be >= 0")
+    if tx_sizing_rule != "cost_aware_scaling":
+        raise ValueError("transaction_costs.sizing_rule must be 'cost_aware_scaling'")
+
+    strategy_raw = data.get("strategy")
+    strategy: StrategyConfig | None = None
+    if strategy_raw is not None:
+        if not isinstance(strategy_raw, dict):
+            raise ValueError("strategy must be an object")
+
+        mode = str(strategy_raw.get("mode", "static")).strip().lower()
+        universe_scope = str(strategy_raw.get("universe_scope", "sp500")).strip().lower()
+        candidate_count = int(strategy_raw.get("candidate_count", 100))
+        portfolio_size = int(strategy_raw.get("portfolio_size", 25))
+        rebalance_interval_quarters = int(strategy_raw.get("rebalance_interval_quarters", 1))
+        lookback_months = int(strategy_raw.get("dividend_payer_lookback", 12))
+        selection_metric = str(
+            strategy_raw.get("selection_metric", "quarter_dividend_yield")
+        ).strip().lower()
+        yield_denominator = str(
+            strategy_raw.get("yield_denominator", "quarter_average_close")
+        ).strip().lower()
+        rebalance_timing = str(
+            strategy_raw.get("rebalance_timing", "first_trading_day_after_quarter_end")
+        ).strip()
+        initial_selection = str(strategy_raw.get("initial_selection", "market_cap")).strip().lower()
+        initial_weighting = str(strategy_raw.get("initial_weighting", "market_cap")).strip().lower()
+        quarterly_weighting_raw = strategy_raw.get("quarterly_weighting")
+        quarterly_weighting = (
+            str(quarterly_weighting_raw).strip().lower()
+            if quarterly_weighting_raw is not None
+            else None
+        )
+        allocation_strategy_raw = strategy_raw.get("allocation_strategy")
+        allocation_strategy: str
+        if allocation_strategy_raw is None and quarterly_weighting is None:
+            allocation_strategy = "yield_proportional"
+        elif allocation_strategy_raw is None:
+            if quarterly_weighting != "normalized_yield_score":
+                raise ValueError(
+                    "strategy.quarterly_weighting is deprecated and only supports "
+                    "'normalized_yield_score'; use strategy.allocation_strategy for new values"
+                )
+            allocation_strategy = _normalize_allocation_strategy(
+                quarterly_weighting,
+                field_name="strategy.quarterly_weighting",
+            )
+        else:
+            allocation_strategy = _normalize_allocation_strategy(
+                allocation_strategy_raw,
+                field_name="strategy.allocation_strategy",
+            )
+            if quarterly_weighting is not None:
+                quarterly_weighting_strategy = _normalize_allocation_strategy(
+                    quarterly_weighting,
+                    field_name="strategy.quarterly_weighting",
+                )
+                if quarterly_weighting != "normalized_yield_score":
+                    raise ValueError(
+                        "strategy.quarterly_weighting is deprecated and only supports "
+                        "'normalized_yield_score'; use strategy.allocation_strategy for new values"
+                    )
+                if quarterly_weighting_strategy != allocation_strategy:
+                    raise ValueError(
+                        "strategy.allocation_strategy conflicts with legacy "
+                        "strategy.quarterly_weighting"
+                    )
+        missing_data_policy = str(
+            strategy_raw.get("missing_data_policy", "backfill_next_ranked")
+        ).strip().lower()
+        sqlite_path = str(strategy_raw.get("sqlite_path", "data/store/portfolio_100.sqlite")).strip()
+        parquet_dir = str(strategy_raw.get("parquet_dir", "data/store/parquet")).strip()
+        parquet_enabled = bool(strategy_raw.get("parquet_enabled", True))
+        csv_export_enabled = bool(strategy_raw.get("csv_export_enabled", False))
+        selection_policy_raw = strategy_raw.get("selection_policy", {})
+        if selection_policy_raw is None:
+            selection_policy_raw = {}
+        if not isinstance(selection_policy_raw, dict):
+            raise ValueError("strategy.selection_policy must be an object")
+        selection_policy_name = str(selection_policy_raw.get("name", "full_refresh")).strip().lower()
+        max_replacements_per_quarter = int(
+            selection_policy_raw.get("max_replacements_per_quarter", portfolio_size)
+        )
+        selection_rank_metric = str(
+            selection_policy_raw.get("rank_metric", "quarter_dividend_yield_score")
+        ).strip().lower()
+        experiment_group_raw = strategy_raw.get("experiment_group")
+        experiment_group: str | None = None
+        if experiment_group_raw is not None:
+            experiment_group = str(experiment_group_raw).strip() or None
+
+        allowed_modes = {"static", "dynamic_100_25"}
+        allowed_selection_policies = {"full_refresh", "replace_bottom_n"}
+        allowed_allocation_strategies = {
+            "equal_weight",
+            "market_cap",
+            "inverse_market_cap",
+            "yield_proportional",
+            "yield_rank_linear",
+        }
+        if mode not in allowed_modes:
+            raise ValueError(f"strategy.mode must be one of {sorted(allowed_modes)}")
+        if universe_scope != "sp500":
+            raise ValueError("strategy.universe_scope must be 'sp500'")
+        if candidate_count <= 0:
+            raise ValueError("strategy.candidate_count must be > 0")
+        if portfolio_size <= 0:
+            raise ValueError("strategy.portfolio_size must be > 0")
+        if portfolio_size > candidate_count:
+            raise ValueError("strategy.portfolio_size must be <= strategy.candidate_count")
+        if rebalance_interval_quarters <= 0:
+            raise ValueError("strategy.rebalance_interval_quarters must be > 0")
+        if lookback_months <= 0:
+            raise ValueError("strategy.dividend_payer_lookback must be > 0")
+        if selection_metric != "quarter_dividend_yield":
+            raise ValueError("strategy.selection_metric must be 'quarter_dividend_yield'")
+        allowed_denoms = {"quarter_average_close", "quarter_start_close", "quarter_end_close"}
+        if yield_denominator not in allowed_denoms:
+            raise ValueError(
+                "strategy.yield_denominator must be one of quarter_average_close, "
+                "quarter_start_close, quarter_end_close"
+            )
+        if rebalance_timing != "first_trading_day_after_quarter_end":
+            raise ValueError(
+                "strategy.rebalance_timing must be 'first_trading_day_after_quarter_end'"
+            )
+        if initial_selection != "market_cap":
+            raise ValueError("strategy.initial_selection must be 'market_cap'")
+        if initial_weighting != "market_cap":
+            raise ValueError("strategy.initial_weighting must be 'market_cap'")
+        if allocation_strategy not in allowed_allocation_strategies:
+            raise ValueError(
+                "strategy.allocation_strategy must be one of "
+                "equal_weight, market_cap, inverse_market_cap, "
+                "yield_proportional, yield_rank_linear"
+            )
+        if missing_data_policy != "backfill_next_ranked":
+            raise ValueError("strategy.missing_data_policy must be 'backfill_next_ranked'")
+        if selection_policy_name not in allowed_selection_policies:
+            raise ValueError(
+                "strategy.selection_policy.name must be one of full_refresh, replace_bottom_n"
+            )
+        if max_replacements_per_quarter < 0:
+            raise ValueError("strategy.selection_policy.max_replacements_per_quarter must be >= 0")
+        if max_replacements_per_quarter > portfolio_size:
+            raise ValueError(
+                "strategy.selection_policy.max_replacements_per_quarter must be <= strategy.portfolio_size"
+            )
+        if selection_rank_metric != "quarter_dividend_yield_score":
+            raise ValueError(
+                "strategy.selection_policy.rank_metric must be 'quarter_dividend_yield_score'"
+            )
+
+        strategy = StrategyConfig(
+            mode=mode,
+            universe_scope=universe_scope,
+            candidate_count=candidate_count,
+            portfolio_size=portfolio_size,
+            rebalance_interval_quarters=rebalance_interval_quarters,
+            dividend_payer_lookback_months=lookback_months,
+            selection_metric=selection_metric,
+            yield_denominator=yield_denominator,
+            rebalance_timing=rebalance_timing,
+            initial_selection=initial_selection,
+            initial_weighting=initial_weighting,
+            allocation_strategy=allocation_strategy,
+            quarterly_weighting=quarterly_weighting,
+            missing_data_policy=missing_data_policy,
+            sqlite_path=sqlite_path,
+            parquet_dir=parquet_dir,
+            parquet_enabled=parquet_enabled,
+            csv_export_enabled=csv_export_enabled,
+            selection_policy=SelectionPolicyConfig(
+                name=selection_policy_name,
+                max_replacements_per_quarter=max_replacements_per_quarter,
+                rank_metric=selection_rank_metric,
+            ),
+            experiment_group=experiment_group,
+        )
+
+    assets_required = strategy is None or strategy.mode != "dynamic_100_25"
+    assets_raw = _require(data, "assets") if assets_required else data.get("assets", [])
+    if not isinstance(assets_raw, list):
+        if assets_required:
+            raise ValueError("assets must be a non-empty list")
+        raise ValueError("assets must be a list")
+    if assets_required and not assets_raw:
         raise ValueError("assets must be a non-empty list")
 
     assets: list[AssetConfig] = []
@@ -122,94 +338,8 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
         seen_rics.add(ric)
         weight_sum += weight
 
-    if abs(weight_sum - 1.0) > 1e-6:
+    if assets and abs(weight_sum - 1.0) > 1e-6:
         raise ValueError(f"Asset weights must sum to 1.0, got {weight_sum:.12f}")
-
-    strategy_raw = data.get("strategy")
-    strategy: StrategyConfig | None = None
-    if strategy_raw is not None:
-        if not isinstance(strategy_raw, dict):
-            raise ValueError("strategy must be an object")
-
-        mode = str(strategy_raw.get("mode", "static")).strip().lower()
-        universe_scope = str(strategy_raw.get("universe_scope", "sp500")).strip().lower()
-        candidate_count = int(strategy_raw.get("candidate_count", 100))
-        portfolio_size = int(strategy_raw.get("portfolio_size", 25))
-        lookback_months = int(strategy_raw.get("dividend_payer_lookback", 12))
-        selection_metric = str(
-            strategy_raw.get("selection_metric", "quarter_dividend_yield")
-        ).strip().lower()
-        yield_denominator = str(
-            strategy_raw.get("yield_denominator", "quarter_average_close")
-        ).strip().lower()
-        rebalance_timing = str(
-            strategy_raw.get("rebalance_timing", "first_trading_day_after_quarter_end")
-        ).strip()
-        initial_selection = str(strategy_raw.get("initial_selection", "market_cap")).strip().lower()
-        initial_weighting = str(strategy_raw.get("initial_weighting", "market_cap")).strip().lower()
-        quarterly_weighting = str(
-            strategy_raw.get("quarterly_weighting", "normalized_yield_score")
-        ).strip().lower()
-        missing_data_policy = str(
-            strategy_raw.get("missing_data_policy", "backfill_next_ranked")
-        ).strip().lower()
-        sqlite_path = str(strategy_raw.get("sqlite_path", "data/store/portfolio_100.sqlite")).strip()
-        parquet_dir = str(strategy_raw.get("parquet_dir", "data/store/parquet")).strip()
-        parquet_enabled = bool(strategy_raw.get("parquet_enabled", True))
-        csv_export_enabled = bool(strategy_raw.get("csv_export_enabled", False))
-
-        allowed_modes = {"static", "dynamic_100_25"}
-        if mode not in allowed_modes:
-            raise ValueError(f"strategy.mode must be one of {sorted(allowed_modes)}")
-        if universe_scope != "sp500":
-            raise ValueError("strategy.universe_scope must be 'sp500'")
-        if candidate_count <= 0:
-            raise ValueError("strategy.candidate_count must be > 0")
-        if portfolio_size <= 0:
-            raise ValueError("strategy.portfolio_size must be > 0")
-        if portfolio_size > candidate_count:
-            raise ValueError("strategy.portfolio_size must be <= strategy.candidate_count")
-        if lookback_months <= 0:
-            raise ValueError("strategy.dividend_payer_lookback must be > 0")
-        if selection_metric != "quarter_dividend_yield":
-            raise ValueError("strategy.selection_metric must be 'quarter_dividend_yield'")
-        allowed_denoms = {"quarter_average_close", "quarter_start_close", "quarter_end_close"}
-        if yield_denominator not in allowed_denoms:
-            raise ValueError(
-                "strategy.yield_denominator must be one of quarter_average_close, "
-                "quarter_start_close, quarter_end_close"
-            )
-        if rebalance_timing != "first_trading_day_after_quarter_end":
-            raise ValueError(
-                "strategy.rebalance_timing must be 'first_trading_day_after_quarter_end'"
-            )
-        if initial_selection != "market_cap":
-            raise ValueError("strategy.initial_selection must be 'market_cap'")
-        if initial_weighting != "market_cap":
-            raise ValueError("strategy.initial_weighting must be 'market_cap'")
-        if quarterly_weighting != "normalized_yield_score":
-            raise ValueError("strategy.quarterly_weighting must be 'normalized_yield_score'")
-        if missing_data_policy != "backfill_next_ranked":
-            raise ValueError("strategy.missing_data_policy must be 'backfill_next_ranked'")
-
-        strategy = StrategyConfig(
-            mode=mode,
-            universe_scope=universe_scope,
-            candidate_count=candidate_count,
-            portfolio_size=portfolio_size,
-            dividend_payer_lookback_months=lookback_months,
-            selection_metric=selection_metric,
-            yield_denominator=yield_denominator,
-            rebalance_timing=rebalance_timing,
-            initial_selection=initial_selection,
-            initial_weighting=initial_weighting,
-            quarterly_weighting=quarterly_weighting,
-            missing_data_policy=missing_data_policy,
-            sqlite_path=sqlite_path,
-            parquet_dir=parquet_dir,
-            parquet_enabled=parquet_enabled,
-            csv_export_enabled=csv_export_enabled,
-        )
 
     return PortfolioConfig(
         base_currency=base_currency,
@@ -231,5 +361,14 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
             dividend_return_basis=dividend_return_basis,
         ),
         assets=assets,
+        transaction_costs=TransactionCostsConfig(
+            enabled=tx_enabled,
+            commission_bps=tx_commission_bps,
+            commission_min_usd=tx_commission_min,
+            slippage_bps_per_side=tx_slippage_bps,
+            fallback_full_spread_bps=tx_fallback_spread_bps,
+            use_bid_ask_when_available=tx_use_bid_ask,
+            sizing_rule=tx_sizing_rule,
+        ),
         strategy=strategy,
     )

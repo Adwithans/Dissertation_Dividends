@@ -4,6 +4,8 @@ from collections.abc import Iterable
 
 import pandas as pd
 
+from ..models import TransactionCostsConfig
+from .transaction_costs import rebalance_to_target_with_costs
 
 def _period_label(ts: pd.Timestamp, frequency: str) -> str:
     if frequency == "quarterly":
@@ -90,6 +92,39 @@ def apply_rebalance(
     total_after = sum(market_after.values()) + portfolio_cash
 
     return shares_by_ric, portfolio_cash, trade_shares_by_ric, trade_value_by_ric, total_after
+
+
+def apply_rebalance_with_costs(
+    *,
+    prices_by_ric: dict[str, float],
+    shares_by_ric: dict[str, float],
+    portfolio_cash: float,
+    target_weights: dict[str, float],
+    transaction_costs: TransactionCostsConfig,
+    bid_by_ric: dict[str, float] | None = None,
+    ask_by_ric: dict[str, float] | None = None,
+):
+    result = rebalance_to_target_with_costs(
+        prices_by_ric=prices_by_ric,
+        shares_by_ric=shares_by_ric,
+        portfolio_cash=portfolio_cash,
+        target_weights=target_weights,
+        tx=transaction_costs,
+        bid_by_ric=bid_by_ric,
+        ask_by_ric=ask_by_ric,
+    )
+    return (
+        result.shares_after,
+        result.cash_after,
+        result.trade_shares_by_ric,
+        result.trade_value_by_ric,
+        result.total_value_after,
+        result.trade_rows,
+        result.commission_cost_total,
+        result.slippage_cost_total,
+        result.spread_cost_total,
+        result.transaction_cost_total,
+    )
 
 
 def compute_drifts(

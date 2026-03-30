@@ -4,6 +4,5 @@
 .venv-refinitiv
 __pycache__/
 data/
-
 /data/
 .DS_Store
