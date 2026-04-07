@@ -53,11 +53,17 @@ def _build_summary(*, run_id: str, total_return: float, trade_count: int) -> dic
             "portfolio_size": 25,
             "rebalance_interval_quarters": 2,
             "allocation_strategy": "yield_proportional",
+            "bond_universe_enabled": True,
+            "baseline_sell_enabled": True,
+            "baseline_sell_threshold": 0.1,
         },
         "strategy": {
             "portfolio_size": 25,
             "rebalance_interval_quarters": 2,
             "allocation_strategy": "yield_proportional",
+            "bond_universe_enabled": True,
+            "baseline_sell_enabled": True,
+            "baseline_sell_threshold": 0.1,
             "selection_policy_name": "replace_bottom_n",
             "max_replacements_per_quarter": 10,
         },
@@ -86,6 +92,9 @@ def test_upsert_experiment_comparison_writes_csv_and_json(tmp_path: Path) -> Non
     assert int(records[0]["rebalance_interval_quarters"]) == 2
     assert int(records[0]["portfolio_size"]) == 25
     assert records[0]["allocation_strategy"] == "yield_proportional"
+    assert bool(records[0]["bond_universe_enabled"]) is True
+    assert bool(records[0]["baseline_sell_enabled"]) is True
+    assert float(records[0]["baseline_sell_threshold"]) == 0.1
 
 
 def test_upsert_experiment_comparison_is_idempotent_by_run_id(tmp_path: Path) -> None:

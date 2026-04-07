@@ -99,6 +99,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override strategy.allocation_strategy for this run.",
     )
+    parser.add_argument(
+        "--enable-bond-universe",
+        action="store_true",
+        help="Enable the supplemental Treasury ETF universe for this run.",
+    )
+    parser.add_argument(
+        "--disable-bond-universe",
+        action="store_true",
+        help="Disable the supplemental Treasury ETF universe for this run.",
+    )
+    parser.add_argument(
+        "--enable-baseline-sell",
+        action="store_true",
+        help="Enable the baseline sell stop-loss rule for this run.",
+    )
+    parser.add_argument(
+        "--disable-baseline-sell",
+        action="store_true",
+        help="Disable the baseline sell stop-loss rule for this run.",
+    )
+    parser.add_argument(
+        "--baseline-sell-threshold",
+        type=float,
+        default=None,
+        help="Override strategy.baseline_sell_threshold for this run.",
+    )
     return parser.parse_args()
 
 
@@ -129,6 +155,18 @@ def _normalized_allocation_strategy(value: str | None) -> str | None:
 
 def _apply_cli_hyperparameter_overrides(config_obj: PortfolioConfig, args: argparse.Namespace) -> PortfolioConfig:
     strategy = config_obj.strategy or StrategyConfig(mode="dynamic_100_25")
+    bond_universe_enabled = strategy.bond_universe.enabled
+    if args.enable_bond_universe:
+        bond_universe_enabled = True
+    if args.disable_bond_universe:
+        bond_universe_enabled = False
+
+    baseline_sell_enabled = strategy.baseline_sell_enabled
+    if args.enable_baseline_sell:
+        baseline_sell_enabled = True
+    if args.disable_baseline_sell:
+        baseline_sell_enabled = False
+
     next_strategy = replace(
         strategy,
         portfolio_size=(
@@ -145,6 +183,16 @@ def _apply_cli_hyperparameter_overrides(config_obj: PortfolioConfig, args: argpa
             _normalized_allocation_strategy(args.allocation_strategy)
             if _normalized_allocation_strategy(args.allocation_strategy) is not None
             else str(strategy.allocation_strategy).strip().lower()
+        ),
+        bond_universe=replace(
+            strategy.bond_universe,
+            enabled=bool(bond_universe_enabled),
+        ),
+        baseline_sell_enabled=bool(baseline_sell_enabled),
+        baseline_sell_threshold=(
+            float(args.baseline_sell_threshold)
+            if args.baseline_sell_threshold is not None
+            else float(strategy.baseline_sell_threshold)
         ),
     )
     return replace(config_obj, strategy=next_strategy)
@@ -191,6 +239,18 @@ def _build_experiment_comparison_row(summary: dict[str, Any]) -> dict[str, Any]:
         "allocation_strategy": hyperparameters.get(
             "allocation_strategy",
             strategy_section.get("allocation_strategy"),
+        ),
+        "bond_universe_enabled": hyperparameters.get(
+            "bond_universe_enabled",
+            strategy_section.get("bond_universe_enabled"),
+        ),
+        "baseline_sell_enabled": hyperparameters.get(
+            "baseline_sell_enabled",
+            strategy_section.get("baseline_sell_enabled"),
+        ),
+        "baseline_sell_threshold": hyperparameters.get(
+            "baseline_sell_threshold",
+            strategy_section.get("baseline_sell_threshold"),
         ),
         "policy_name": strategy_section.get("selection_policy_name", "full_refresh"),
         "max_replacements_per_quarter": strategy_section.get("max_replacements_per_quarter"),

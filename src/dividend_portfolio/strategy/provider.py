@@ -821,7 +821,12 @@ class RefinitivStrategyDataProvider:
             start_date=start_date,
             end_date=end_date,
         )
-        fields = ["TR.DivExDate", "TR.DivUnadjustedGross"]
+        fields = [
+            "TR.DivExDate",
+            "TR.DivUnadjustedGross",
+            "TR.FundExDate",
+            "TR.FundDiv",
+        ]
 
         def collect_dividend_parts(frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
             parts_local: list[pd.DataFrame] = []
@@ -831,7 +836,12 @@ class RefinitivStrategyDataProvider:
 
                 ric_col = _pick_col(df, ("instrument",))
                 date_col = _pick_col(df, ("ex", "date")) or _pick_col(df, ("date",))
-                amt_col = _pick_col(df, ("gross",)) or _pick_col(df, ("div", "amount"))
+                amt_col = (
+                    _pick_col(df, ("gross",))
+                    or _pick_col(df, ("fund", "div"))
+                    or _pick_col(df, ("dividend",))
+                    or _pick_col(df, ("div", "amount"))
+                )
                 if ric_col is None or date_col is None or amt_col is None:
                     continue
 

@@ -49,6 +49,10 @@ def _apply_hyperparameters(
 ) -> PortfolioConfig:
     strategy = _strategy_or_default(base_config)
     values = dict(hyperparameters or {})
+    next_bond_universe = replace(
+        strategy.bond_universe,
+        enabled=bool(values.get("bond_universe_enabled", strategy.bond_universe.enabled)),
+    )
     next_strategy = replace(
         strategy,
         portfolio_size=int(values.get("portfolio_size", strategy.portfolio_size)),
@@ -56,9 +60,16 @@ def _apply_hyperparameters(
             values.get("rebalance_interval_quarters", strategy.rebalance_interval_quarters)
         ),
         allocation_strategy=str(values.get("allocation_strategy", strategy.allocation_strategy)).strip().lower(),
+        bond_universe=next_bond_universe,
+        baseline_sell_enabled=bool(values.get("baseline_sell_enabled", strategy.baseline_sell_enabled)),
+        baseline_sell_threshold=float(
+            values.get("baseline_sell_threshold", strategy.baseline_sell_threshold)
+        ),
         parquet_enabled=(strategy.parquet_enabled if persist == "full" else False),
         csv_export_enabled=(strategy.csv_export_enabled if persist == "full" else False),
     )
+    if next_strategy.baseline_sell_enabled and not next_strategy.bond_universe.enabled:
+        raise ValueError("baseline_sell_enabled requires bond_universe_enabled = true")
     return replace(base_config, strategy=next_strategy)
 
 
@@ -68,6 +79,9 @@ def _extract_hyperparameters(config: PortfolioConfig) -> dict[str, Any]:
         "portfolio_size": int(strategy.portfolio_size),
         "rebalance_interval_quarters": int(strategy.rebalance_interval_quarters),
         "allocation_strategy": str(strategy.allocation_strategy).strip().lower(),
+        "bond_universe_enabled": bool(strategy.bond_universe.enabled),
+        "baseline_sell_enabled": bool(strategy.baseline_sell_enabled),
+        "baseline_sell_threshold": float(strategy.baseline_sell_threshold),
     }
 
 

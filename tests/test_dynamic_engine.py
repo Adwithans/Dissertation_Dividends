@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import math
 from pathlib import Path
 
 import pandas as pd
 
 from src.dividend_portfolio.models import (
     AssetConfig,
+    BondUniverseConfig,
     PortfolioConfig,
     QuarterlyMetricsConfig,
     RebalanceConfig,
@@ -98,6 +100,66 @@ def _build_fake_provider() -> FakeProvider:
     ]
     dividends = pd.DataFrame(div_rows)
 
+    return FakeProvider(rics=rics, market_caps=market_caps, prices=prices, dividends=dividends)
+
+
+def _build_provider_with_bonds(
+    *,
+    trigger_stock_drop: bool = False,
+    drop_bond_after_purchase: bool = False,
+    bond_dividends_available: bool = True,
+) -> FakeProvider:
+    rics = ["A", "B", "C", "D", "IEF.OQ", "TLT.OQ"]
+    market_caps = {
+        "A": 400.0,
+        "B": 300.0,
+        "C": 200.0,
+        "D": 100.0,
+        "IEF.OQ": 500.0,
+        "TLT.OQ": 600.0,
+    }
+
+    dates = pd.bdate_range("2024-01-02", "2024-09-30")
+    price_rows = []
+    for ric in rics:
+        for dt in dates:
+            close = 100.0
+            if ric == "A" and trigger_stock_drop:
+                if dt >= pd.Timestamp("2024-04-16"):
+                    close = 84.0
+                elif dt >= pd.Timestamp("2024-04-15"):
+                    close = 85.0
+            if ric == "TLT.OQ" and drop_bond_after_purchase and dt >= pd.Timestamp("2024-04-17"):
+                close = 80.0
+            price_rows.append({"Date": dt, "RIC": ric, "CLOSE": close})
+    prices = pd.DataFrame(price_rows)
+
+    div_rows = [
+        {"Date": pd.Timestamp("2023-12-15"), "RIC": "A", "Dividend": 0.5},
+        {"Date": pd.Timestamp("2023-12-15"), "RIC": "B", "Dividend": 0.5},
+        {"Date": pd.Timestamp("2023-12-15"), "RIC": "C", "Dividend": 0.5},
+        {"Date": pd.Timestamp("2023-12-15"), "RIC": "D", "Dividend": 0.5},
+        {"Date": pd.Timestamp("2024-02-15"), "RIC": "A", "Dividend": 3.0},
+        {"Date": pd.Timestamp("2024-02-15"), "RIC": "B", "Dividend": 2.0},
+        {"Date": pd.Timestamp("2024-02-15"), "RIC": "C", "Dividend": 1.0},
+        {"Date": pd.Timestamp("2024-02-15"), "RIC": "D", "Dividend": 0.5},
+        {"Date": pd.Timestamp("2024-05-15"), "RIC": "A", "Dividend": 1.0},
+        {"Date": pd.Timestamp("2024-05-15"), "RIC": "B", "Dividend": 1.0},
+        {"Date": pd.Timestamp("2024-05-15"), "RIC": "C", "Dividend": 1.0},
+        {"Date": pd.Timestamp("2024-05-15"), "RIC": "D", "Dividend": 1.0},
+    ]
+    if bond_dividends_available:
+        div_rows.extend(
+            [
+                {"Date": pd.Timestamp("2023-12-15"), "RIC": "IEF.OQ", "Dividend": 0.5},
+                {"Date": pd.Timestamp("2023-12-15"), "RIC": "TLT.OQ", "Dividend": 0.5},
+                {"Date": pd.Timestamp("2024-02-15"), "RIC": "IEF.OQ", "Dividend": 1.5},
+                {"Date": pd.Timestamp("2024-02-15"), "RIC": "TLT.OQ", "Dividend": 4.0},
+                {"Date": pd.Timestamp("2024-05-15"), "RIC": "IEF.OQ", "Dividend": 2.5},
+                {"Date": pd.Timestamp("2024-05-15"), "RIC": "TLT.OQ", "Dividend": 3.5},
+            ]
+        )
+    dividends = pd.DataFrame(div_rows)
     return FakeProvider(rics=rics, market_caps=market_caps, prices=prices, dividends=dividends)
 
 
@@ -545,9 +607,15 @@ def test_build_weighted_selection_supports_allocation_strategies() -> None:
 
     assert all(math.isclose(float(w), 1.0 / 3.0, rel_tol=1e-12) for w in equal_weight["Weight"])
     assert list(market_cap["Weight"]) == [0.5, 1.0 / 3.0, 1.0 / 6.0]
-    assert list(inverse_market_cap["Weight"]) == [1.0 / 6.0, 1.0 / 4.0, 7.0 / 12.0]
-    assert list(yield_prop["Weight"]) == [0.5, 1.0 / 3.0, 1.0 / 6.0]
-    assert list(yield_rank["Weight"]) == [0.5, 1.0 / 3.0, 1.0 / 6.0]
+    assert list(inverse_market_cap["Weight"]) == [2.0 / 11.0, 3.0 / 11.0, 6.0 / 11.0]
+    assert all(
+        math.isclose(float(actual), float(expected), rel_tol=1e-12)
+        for actual, expected in zip(yield_prop["Weight"], [0.5, 1.0 / 3.0, 1.0 / 6.0], strict=False)
+    )
+    assert all(
+        math.isclose(float(actual), float(expected), rel_tol=1e-12)
+        for actual, expected in zip(yield_rank["Weight"], [0.5, 1.0 / 3.0, 1.0 / 6.0], strict=False)
+    )
 
 
 def test_dynamic_engine_market_cap_allocation_strategy_reweights_selected_names(tmp_path: Path) -> None:
@@ -605,5 +673,201 @@ def test_dynamic_engine_market_cap_allocation_strategy_reweights_selected_names(
     weights = {str(row["ric"]): float(row["weight"]) for row in q2.to_dict(orient="records")}
     assert math.isclose(weights["A"], 2.0 / 3.0, rel_tol=1e-12)
     assert math.isclose(weights["C"], 1.0 / 3.0, rel_tol=1e-12)
+
+    store.close()
+
+
+def test_dynamic_engine_bond_universe_can_compete_for_normal_slots(tmp_path: Path) -> None:
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 6, 30),
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=True,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.0,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("A", 1.0)],
+        strategy=StrategyConfig(
+            mode="dynamic_100_25",
+            candidate_count=4,
+            portfolio_size=2,
+            rebalance_interval_quarters=1,
+            allocation_strategy="yield_proportional",
+            bond_universe=BondUniverseConfig(enabled=True, rics=("IEF.OQ", "TLT.OQ")),
+            baseline_sell_enabled=False,
+            sqlite_path=str(tmp_path / "dyn_bonds.sqlite"),
+            parquet_dir=str(tmp_path / "parquet"),
+            parquet_enabled=False,
+            csv_export_enabled=False,
+        ),
+    )
+
+    provider = _build_provider_with_bonds()
+    store = StrategyStore(tmp_path / "dyn_bonds.sqlite")
+    result = run_dynamic_rotation(
+        config=cfg,
+        provider=provider,
+        store=store,
+        start_date="2024-01-02",
+        end_date="2024-06-30",
+        run_id="run_bond_universe",
+    )
+
+    q1 = result.target_weights.loc[result.target_weights["quarter"] == "2024Q1"].sort_values("rank_in_portfolio")
+    q2 = result.target_weights.loc[result.target_weights["quarter"] == "2024Q2"].sort_values("rank_in_portfolio")
+
+    assert list(q1["ric"]) == ["A", "B"]
+    assert "TLT.OQ" in set(result.candidate_universe.loc[result.candidate_universe["quarter"] == "2024Q1", "ric"])
+    assert list(q2["ric"]) == ["TLT.OQ", "A"]
+
+    store.close()
+
+
+def test_dynamic_engine_baseline_sell_routes_into_top_bond_and_bonds_are_exempt(tmp_path: Path) -> None:
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 6, 30),
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=True,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.0,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("A", 1.0)],
+        strategy=StrategyConfig(
+            mode="dynamic_100_25",
+            candidate_count=4,
+            portfolio_size=2,
+            rebalance_interval_quarters=2,
+            allocation_strategy="yield_proportional",
+            bond_universe=BondUniverseConfig(enabled=True, rics=("IEF.OQ", "TLT.OQ")),
+            baseline_sell_enabled=True,
+            baseline_sell_threshold=0.10,
+            sqlite_path=str(tmp_path / "dyn_stop.sqlite"),
+            parquet_dir=str(tmp_path / "parquet"),
+            parquet_enabled=False,
+            csv_export_enabled=False,
+        ),
+    )
+
+    provider = _build_provider_with_bonds(trigger_stock_drop=True, drop_bond_after_purchase=True)
+    store = StrategyStore(tmp_path / "dyn_stop.sqlite")
+    result = run_dynamic_rotation(
+        config=cfg,
+        provider=provider,
+        store=store,
+        start_date="2024-01-02",
+        end_date="2024-06-30",
+        run_id="run_baseline_sell",
+    )
+
+    trades = result.trades.copy()
+    exit_trades = trades.loc[trades["reason"].astype(str) == "baseline_sell_exit"].copy()
+    refuge_buys = trades.loc[trades["reason"].astype(str) == "baseline_sell_refuge_buy"].copy()
+
+    assert not exit_trades.empty
+    assert not refuge_buys.empty
+    assert set(exit_trades["ric"].astype(str)) == {"A"}
+    assert set(refuge_buys["ric"].astype(str)) == {"TLT.OQ"}
+    assert exit_trades["date"].iloc[0] == "2024-04-16"
+    assert refuge_buys["date"].iloc[0] == "2024-04-16"
+
+    held_after_stop = result.holdings_daily.loc[
+        (pd.to_datetime(result.holdings_daily["date"]) >= pd.Timestamp("2024-04-16"))
+        & (result.holdings_daily["ric"].astype(str) == "TLT.OQ")
+        & (pd.to_numeric(result.holdings_daily["shares"], errors="coerce") > 0)
+    ]
+    assert not held_after_stop.empty
+
+    assert not (
+        (trades["reason"].astype(str) == "baseline_sell_exit")
+        & (trades["ric"].astype(str) == "TLT.OQ")
+    ).any()
+
+    store.close()
+
+
+def test_dynamic_engine_baseline_sell_can_use_bonds_even_when_not_candidates(tmp_path: Path) -> None:
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 6, 30),
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=True,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.0,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("A", 1.0)],
+        strategy=StrategyConfig(
+            mode="dynamic_100_25",
+            candidate_count=4,
+            portfolio_size=2,
+            rebalance_interval_quarters=2,
+            allocation_strategy="yield_proportional",
+            bond_universe=BondUniverseConfig(enabled=True, rics=("IEF.OQ", "TLT.OQ")),
+            baseline_sell_enabled=True,
+            baseline_sell_threshold=0.10,
+            sqlite_path=str(tmp_path / "dyn_stop_prefetch.sqlite"),
+            parquet_dir=str(tmp_path / "parquet"),
+            parquet_enabled=False,
+            csv_export_enabled=False,
+        ),
+    )
+
+    provider = _build_provider_with_bonds(
+        trigger_stock_drop=True,
+        drop_bond_after_purchase=False,
+        bond_dividends_available=False,
+    )
+    store = StrategyStore(tmp_path / "dyn_stop_prefetch.sqlite")
+    result = run_dynamic_rotation(
+        config=cfg,
+        provider=provider,
+        store=store,
+        start_date="2024-01-02",
+        end_date="2024-06-30",
+        run_id="run_baseline_sell_prefetch",
+    )
+
+    q1_candidates = set(
+        result.candidate_universe.loc[result.candidate_universe["quarter"] == "2024Q1", "ric"].astype(str).tolist()
+    )
+    assert "IEF.OQ" not in q1_candidates
+    assert "TLT.OQ" not in q1_candidates
+
+    refuge_buys = result.trades.loc[result.trades["reason"].astype(str) == "baseline_sell_refuge_buy"].copy()
+    assert not refuge_buys.empty
+    assert set(refuge_buys["ric"].astype(str)).issubset({"IEF.OQ", "TLT.OQ"})
 
     store.close()

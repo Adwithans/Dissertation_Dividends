@@ -9,6 +9,7 @@ import pandas as pd
 import src.dividend_portfolio.optimization.genetic_algorithm as ga_module
 from src.dividend_portfolio.models import (
     AssetConfig,
+    BondUniverseConfig,
     PortfolioConfig,
     QuarterlyMetricsConfig,
     RebalanceConfig,
@@ -19,6 +20,10 @@ from src.dividend_portfolio.optimization import (
     GeneticSearchSpace,
     run_genetic_algorithm,
 )
+
+
+def test_genetic_search_space_default_matches_single_supported_default() -> None:
+    assert GeneticSearchSpace.intensive_defaults() == GeneticSearchSpace()
 
 
 @dataclass
@@ -152,6 +157,9 @@ def test_run_genetic_algorithm_returns_pareto_front(tmp_path: Path) -> None:
     assert Path(result.study_artifacts["population_history_csv"]).exists()
     assert Path(result.study_artifacts["best_by_return_summary_json"]).exists()
     assert Path(result.study_artifacts["best_by_drawdown_summary_json"]).exists()
+    assert "bond_universe_enabled" in result.trial_results[0]
+    assert "baseline_sell_enabled" in result.trial_results[0]
+    assert "baseline_sell_threshold" in result.trial_results[0]
     for individual in result.final_population:
         assert individual.hyperparameters["portfolio_size"] in {1, 2}
         assert individual.hyperparameters["rebalance_interval_quarters"] in {1, 2}
@@ -362,3 +370,96 @@ def test_run_genetic_algorithm_prefetches_benchmarks_once(monkeypatch, tmp_path:
 def test_process_pool_context_uses_spawn_on_macos(monkeypatch) -> None:
     monkeypatch.setattr(ga_module.sys, "platform", "darwin")
     assert ga_module._process_pool_context_name() == "spawn"
+
+
+def test_genetic_search_space_only_varies_threshold_when_baseline_sell_enabled() -> None:
+    inactive = GeneticSearchSpace(
+        portfolio_sizes=(10,),
+        rebalance_interval_quarters=(1,),
+        allocation_strategies=("equal_weight",),
+        baseline_sell_thresholds=(0.05, 0.10),
+    ).validated(candidate_count=10, baseline_sell_enabled=False)
+    active = GeneticSearchSpace(
+        portfolio_sizes=(10,),
+        rebalance_interval_quarters=(1,),
+        allocation_strategies=("equal_weight",),
+        baseline_sell_thresholds=(0.05, 0.10),
+    ).validated(candidate_count=10, baseline_sell_enabled=True)
+
+    assert inactive.combination_count() == 1
+    assert inactive.all_combinations() == [
+        {
+            "portfolio_size": 10,
+            "rebalance_interval_quarters": 1,
+            "allocation_strategy": "equal_weight",
+        }
+    ]
+    assert active.combination_count() == 2
+    assert {
+        combination["baseline_sell_threshold"]
+        for combination in active.all_combinations()
+    } == {0.05, 0.10}
+
+
+def test_run_genetic_algorithm_includes_threshold_when_baseline_sell_enabled(tmp_path: Path) -> None:
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 9, 30),
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=True,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.0,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("A", 1.0)],
+        strategy=StrategyConfig(
+            mode="dynamic_100_25",
+            candidate_count=4,
+            portfolio_size=2,
+            rebalance_interval_quarters=1,
+            allocation_strategy="yield_proportional",
+            bond_universe=BondUniverseConfig(enabled=True, rics=("A",)),
+            baseline_sell_enabled=True,
+            baseline_sell_threshold=0.10,
+            sqlite_path=str(tmp_path / "dyn.sqlite"),
+            parquet_dir=str(tmp_path / "parquet"),
+            parquet_enabled=False,
+            csv_export_enabled=False,
+        ),
+    )
+
+    result = run_genetic_algorithm(
+        base_config=cfg,
+        search_space=GeneticSearchSpace(
+            portfolio_sizes=(1,),
+            rebalance_interval_quarters=(1,),
+            allocation_strategies=("equal_weight",),
+            baseline_sell_thresholds=(0.05, 0.10),
+        ),
+        config=GeneticAlgorithmConfig(
+            population_size=2,
+            generations=1,
+            elite_count=0,
+            random_seed=13,
+            persist_trials="none",
+            benchmark="none",
+            trial_output_dir=tmp_path / "ga_trials",
+        ),
+        provider=_build_fake_provider(),
+    )
+
+    assert result.total_trials_evaluated == 2
+    assert {
+        row["baseline_sell_threshold"]
+        for row in result.trial_results
+    } == {0.05, 0.10}

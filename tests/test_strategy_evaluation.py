@@ -153,6 +153,9 @@ def test_evaluate_strategy_summary_only_returns_compact_metrics(tmp_path: Path) 
     assert result.hyperparameters["portfolio_size"] == 2
     assert result.hyperparameters["rebalance_interval_quarters"] == 1
     assert result.hyperparameters["allocation_strategy"] == "yield_rank_linear"
+    assert result.hyperparameters["bond_universe_enabled"] is False
+    assert result.hyperparameters["baseline_sell_enabled"] is False
+    assert result.hyperparameters["baseline_sell_threshold"] == 0.10
     assert "cagr" in result.objective_metrics
     assert "max_drawdown" in result.constraint_metrics
     assert "total_dividend_cash" in result.diagnostic_metrics
@@ -250,3 +253,53 @@ def test_evaluate_strategy_enables_persistent_provider_cache_by_default(monkeypa
     )
 
     assert captured["persistent_cache_enabled"] is True
+
+
+def test_evaluate_strategy_rejects_baseline_sell_without_bond_universe(tmp_path: Path) -> None:
+    cfg = PortfolioConfig(
+        base_currency="USD",
+        initial_capital=1000.0,
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 3, 31),
+        reinvest_dividends=False,
+        auto_align_splits=True,
+        use_cum_factor=True,
+        risk_free_rate=0.0,
+        rebalancing=RebalanceConfig(
+            enabled=True,
+            frequency="quarterly",
+            trigger="first_trading_day_after_quarter_end",
+            drift_tolerance=0.0,
+        ),
+        quarterly_metrics=QuarterlyMetricsConfig(
+            enabled=True,
+            dividend_return_basis="quarter_start_market_value",
+        ),
+        assets=[AssetConfig("A", 1.0)],
+        strategy=StrategyConfig(
+            mode="dynamic_100_25",
+            candidate_count=4,
+            portfolio_size=2,
+            sqlite_path=str(tmp_path / "dyn.sqlite"),
+            parquet_dir=str(tmp_path / "parquet"),
+            parquet_enabled=False,
+            csv_export_enabled=False,
+        ),
+    )
+
+    try:
+        evaluate_strategy(
+            base_config=cfg,
+            hyperparameters={
+                "bond_universe_enabled": False,
+                "baseline_sell_enabled": True,
+            },
+            persist="none",
+            benchmark="none",
+        )
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid baseline sell override")
+
+    assert "baseline_sell_enabled requires bond_universe_enabled" in message

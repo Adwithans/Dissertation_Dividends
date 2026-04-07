@@ -13,7 +13,7 @@ This version is the full intensive sweep:
   - minimize drawdown
 
 ```bash
-python -m src.dividend_portfolio.cli.run_genetic_search \
+python -m src.dividend_portfolio.optimization.genetic_algorithm \
   --config config/portfolio.yaml \
   --benchmark sp500 \
   --persist-trials none \
@@ -50,6 +50,15 @@ Default study output folder:
 Notes:
 - This uses whatever `python` is active in your shell.
 - On macOS, use the module command above rather than a heredoc (`python - <<'PY'`) when `max_workers > 1`. The multiprocessing `spawn` context requires a real module/script entrypoint.
+- `src.dividend_portfolio.cli.run_genetic_search` now just delegates to this same module, so there is only one real GA entrypoint.
+- At startup, the runner now prints:
+  - `search_space_combinations`
+  - `population_size`
+  - `parallel_enabled`
+  - `requested_max_workers`
+  - `effective_max_workers`
+  - `process_pool_context`
+  - and `parallel_disable_reason` when parallelism is not active
 - Because `population_size=space.combination_count()` and `generations=1`, this is effectively a full grid search over the current discrete hyperparameter space while still using the same GA entrypoint.
 - The search objective is benchmark-aware in this run, so `trial_results.csv` will include `search_cagr`, `search_annualized_excess_return`, `search_strategy_up_benchmark_down_periods`, `search_inverse_strategy_down_benchmark_up_periods`, and `search_max_drawdown`.
 - Benchmark `.SPX` and `.RUI` close history is prefetched once per study and persisted in `data/store/benchmark_cache.sqlite`, so reruns do not keep consuming extra Refinitiv calls for those series.

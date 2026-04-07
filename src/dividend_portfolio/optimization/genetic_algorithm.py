@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 from concurrent.futures import ProcessPoolExecutor
 import csv
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
@@ -17,9 +19,19 @@ from typing import Any
 
 import pandas as pd
 
-from ..models import EvaluationContext, EvaluationResult, PortfolioConfig
-from ..reporting.dynamic_results import generate_dynamic_showresults
-from ..strategy.evaluation import evaluate_strategy, prepare_benchmark_data
+try:
+    from ..config import load_portfolio_config
+    from ..models import EvaluationContext, EvaluationResult, PortfolioConfig
+    from ..reporting.dynamic_results import generate_dynamic_showresults
+    from ..strategy.evaluation import evaluate_strategy, prepare_benchmark_data
+except ImportError:
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from src.dividend_portfolio.config import load_portfolio_config
+    from src.dividend_portfolio.models import EvaluationContext, EvaluationResult, PortfolioConfig
+    from src.dividend_portfolio.reporting.dynamic_results import generate_dynamic_showresults
+    from src.dividend_portfolio.strategy.evaluation import evaluate_strategy, prepare_benchmark_data
 
 
 ALLOCATION_STRATEGIES = (
@@ -29,23 +41,28 @@ ALLOCATION_STRATEGIES = (
     "yield_proportional",
     "yield_rank_linear",
 )
+BASELINE_SELL_THRESHOLDS = (0.05, 0.075, 0.10, 0.125, 0.15, 0.20)
+DEFAULT_PORTFOLIO_SIZES = tuple(range(7, 36))
+DEFAULT_REBALANCE_INTERVALS = (1, 2, 3, 4)
 
 
 @dataclass(frozen=True)
 class GeneticSearchSpace:
-    portfolio_sizes: tuple[int, ...] = (10, 15, 20, 25, 30)
-    rebalance_interval_quarters: tuple[int, ...] = (1, 2, 4)
+    portfolio_sizes: tuple[int, ...] = DEFAULT_PORTFOLIO_SIZES
+    rebalance_interval_quarters: tuple[int, ...] = DEFAULT_REBALANCE_INTERVALS
     allocation_strategies: tuple[str, ...] = ALLOCATION_STRATEGIES
+    baseline_sell_thresholds: tuple[float, ...] = BASELINE_SELL_THRESHOLDS
 
     @classmethod
     def intensive_defaults(cls) -> "GeneticSearchSpace":
-        return cls(
-            portfolio_sizes=tuple(range(7, 36)),
-            rebalance_interval_quarters=(1, 2, 3, 4),
-            allocation_strategies=ALLOCATION_STRATEGIES,
-        )
+        return cls()
 
-    def validated(self, *, candidate_count: int | None = None) -> "GeneticSearchSpace":
+    def validated(
+        self,
+        *,
+        candidate_count: int | None = None,
+        baseline_sell_enabled: bool = False,
+    ) -> "GeneticSearchSpace":
         portfolio_sizes = tuple(
             sorted(
                 {
@@ -63,6 +80,15 @@ class GeneticSearchSpace:
             for v in self.allocation_strategies
             if str(v).strip().lower()
         )
+        baseline_sell_thresholds = tuple(
+            sorted(
+                {
+                    float(v)
+                    for v in self.baseline_sell_thresholds
+                    if float(v) > 0.0 and float(v) < 1.0
+                }
+            )
+        )
         if not portfolio_sizes:
             raise ValueError("GeneticSearchSpace.portfolio_sizes must contain at least one positive value")
         if not rebalance_interval_quarters:
@@ -73,25 +99,41 @@ class GeneticSearchSpace:
             raise ValueError(
                 "GeneticSearchSpace.allocation_strategies must contain at least one non-empty value"
             )
+        if baseline_sell_enabled and not baseline_sell_thresholds:
+            raise ValueError(
+                "GeneticSearchSpace.baseline_sell_thresholds must contain at least one value in (0, 1)"
+            )
         return GeneticSearchSpace(
             portfolio_sizes=portfolio_sizes,
             rebalance_interval_quarters=rebalance_interval_quarters,
             allocation_strategies=allocation_strategies,
+            baseline_sell_thresholds=(
+                baseline_sell_thresholds if baseline_sell_enabled else tuple()
+            ),
         )
 
     def all_combinations(self) -> list[dict[str, Any]]:
-        return [
-            {
+        thresholds: tuple[float | None, ...] = (
+            tuple(float(v) for v in self.baseline_sell_thresholds)
+            if self.baseline_sell_thresholds
+            else (None,)
+        )
+        combinations: list[dict[str, Any]] = []
+        for portfolio_size, rebalance_interval, allocation_strategy, baseline_sell_threshold in itertools.product(
+            self.portfolio_sizes,
+            self.rebalance_interval_quarters,
+            self.allocation_strategies,
+            thresholds,
+        ):
+            row = {
                 "portfolio_size": int(portfolio_size),
                 "rebalance_interval_quarters": int(rebalance_interval),
                 "allocation_strategy": str(allocation_strategy).strip().lower(),
             }
-            for portfolio_size, rebalance_interval, allocation_strategy in itertools.product(
-                self.portfolio_sizes,
-                self.rebalance_interval_quarters,
-                self.allocation_strategies,
-            )
-        ]
+            if baseline_sell_threshold is not None:
+                row["baseline_sell_threshold"] = float(baseline_sell_threshold)
+            combinations.append(row)
+        return combinations
 
     def combination_count(self) -> int:
         return len(self.all_combinations())
@@ -112,7 +154,7 @@ class GeneticAlgorithmConfig:
     trial_output_dir: str | Path | None = None
     persist_study_artifacts: bool = True
     study_output_dir: str | Path | None = None
-    max_workers: int = 1
+    max_workers: int = 5
     generate_winner_full_summaries: bool = True
 
 
@@ -192,12 +234,15 @@ def _search_objective_values(
     return {name: values.get(name) for name in _search_objective_names(config)}
 
 
-def _hyperparameter_key(hyperparameters: dict[str, Any]) -> tuple[int, int, str]:
-    return (
+def _hyperparameter_key(hyperparameters: dict[str, Any]) -> tuple[Any, ...]:
+    key: list[Any] = [
         int(hyperparameters["portfolio_size"]),
         int(hyperparameters["rebalance_interval_quarters"]),
         str(hyperparameters["allocation_strategy"]).strip().lower(),
-    )
+    ]
+    if "baseline_sell_threshold" in hyperparameters:
+        key.append(round(float(hyperparameters["baseline_sell_threshold"]), 10))
+    return tuple(key)
 
 
 def _study_id(search_space: GeneticSearchSpace, config: GeneticAlgorithmConfig) -> str:
@@ -207,6 +252,7 @@ def _study_id(search_space: GeneticSearchSpace, config: GeneticAlgorithmConfig) 
         "portfolio_sizes": list(search_space.portfolio_sizes),
         "rebalance_interval_quarters": list(search_space.rebalance_interval_quarters),
         "allocation_strategies": list(search_space.allocation_strategies),
+        "baseline_sell_thresholds": list(search_space.baseline_sell_thresholds),
         "population_size": int(config.population_size),
         "generations": int(config.generations),
         "random_seed": config.random_seed,
@@ -284,6 +330,21 @@ def _compact_evaluation_result(evaluation: EvaluationResult) -> EvaluationResult
     )
 
 
+def _effective_hyperparameters(
+    *,
+    base_config: PortfolioConfig,
+    hyperparameters: dict[str, Any],
+) -> dict[str, Any]:
+    strategy = base_config.strategy
+    effective = dict(hyperparameters)
+    if strategy is None:
+        return effective
+    effective.setdefault("bond_universe_enabled", bool(strategy.bond_universe.enabled))
+    effective.setdefault("baseline_sell_enabled", bool(strategy.baseline_sell_enabled))
+    effective.setdefault("baseline_sell_threshold", float(strategy.baseline_sell_threshold))
+    return effective
+
+
 def _worker_payload(
     *,
     base_config: PortfolioConfig,
@@ -348,6 +409,35 @@ def _can_parallelize(provider, *, config: GeneticAlgorithmConfig) -> bool:
     return True
 
 
+def _parallel_diagnostics(provider, *, config: GeneticAlgorithmConfig) -> dict[str, Any]:
+    requested = max(int(config.max_workers), 1)
+    context_name = _process_pool_context_name()
+    supports_spawn = _supports_spawn_process_pool()
+    effective = _process_pool_max_workers(config)
+    reason: str | None = None
+    if requested <= 1:
+        reason = "max_workers<=1"
+    elif os.name == "nt":
+        reason = "windows_process_pool_disabled"
+    elif context_name == "spawn" and not supports_spawn:
+        reason = "spawn_requires_module_or_script_entrypoint"
+    else:
+        try:
+            pickle.dumps(provider)
+        except Exception:  # noqa: BLE001
+            if provider is not None:
+                reason = "provider_not_picklable"
+    parallel_enabled = reason is None
+    return {
+        "parallel_enabled": bool(parallel_enabled),
+        "requested_max_workers": int(requested),
+        "effective_max_workers": int(effective if parallel_enabled else 1),
+        "process_pool_context": context_name,
+        "supports_spawn_process_pool": bool(supports_spawn),
+        "parallel_disable_reason": reason,
+    }
+
+
 def _process_pool_max_workers(config: GeneticAlgorithmConfig) -> int:
     requested = max(int(config.max_workers), 1)
     cpu_count = os.cpu_count() or 1
@@ -376,11 +466,14 @@ def _individual_row(
     study_id: str,
     individual: GeneticIndividual,
     population_generation: int | None = None,
-    front_keys: set[tuple[int, int, str]] | None = None,
-    best_by_return_key: tuple[int, int, str] | None = None,
-    best_by_drawdown_key: tuple[int, int, str] | None = None,
+    front_keys: set[tuple[Any, ...]] | None = None,
+    best_by_return_key: tuple[Any, ...] | None = None,
+    best_by_drawdown_key: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     key = _hyperparameter_key(individual.hyperparameters)
+    effective_hyperparameters = dict(individual.evaluation.hyperparameters or {})
+    for hp_key, hp_value in individual.hyperparameters.items():
+        effective_hyperparameters.setdefault(hp_key, hp_value)
     row: dict[str, Any] = {
         "study_id": study_id,
         "run_id": individual.evaluation.run_id,
@@ -391,9 +484,12 @@ def _individual_row(
         ),
         "status": "failed" if individual.error else "ok",
         "error": individual.error,
-        "portfolio_size": int(individual.hyperparameters["portfolio_size"]),
-        "rebalance_interval_quarters": int(individual.hyperparameters["rebalance_interval_quarters"]),
-        "allocation_strategy": str(individual.hyperparameters["allocation_strategy"]),
+        "portfolio_size": int(effective_hyperparameters["portfolio_size"]),
+        "rebalance_interval_quarters": int(effective_hyperparameters["rebalance_interval_quarters"]),
+        "allocation_strategy": str(effective_hyperparameters["allocation_strategy"]),
+        "bond_universe_enabled": bool(effective_hyperparameters.get("bond_universe_enabled", False)),
+        "baseline_sell_enabled": bool(effective_hyperparameters.get("baseline_sell_enabled", False)),
+        "baseline_sell_threshold": effective_hyperparameters.get("baseline_sell_threshold"),
         "pareto_rank": int(individual.pareto_rank),
         "crowding_distance": (
             None if math.isinf(individual.crowding_distance) else float(individual.crowding_distance)
@@ -436,11 +532,14 @@ def _random_hyperparameters(
     *,
     rng: random.Random,
 ) -> dict[str, Any]:
-    return {
+    hyperparameters = {
         "portfolio_size": rng.choice(search_space.portfolio_sizes),
         "rebalance_interval_quarters": rng.choice(search_space.rebalance_interval_quarters),
         "allocation_strategy": rng.choice(search_space.allocation_strategies),
     }
+    if search_space.baseline_sell_thresholds:
+        hyperparameters["baseline_sell_threshold"] = rng.choice(search_space.baseline_sell_thresholds)
+    return hyperparameters
 
 
 def _crossover(
@@ -453,7 +552,10 @@ def _crossover(
     if rng.random() >= float(crossover_rate):
         return dict(parent_a)
     child: dict[str, Any] = {}
-    for key in ["portfolio_size", "rebalance_interval_quarters", "allocation_strategy"]:
+    keys = ["portfolio_size", "rebalance_interval_quarters", "allocation_strategy"]
+    if "baseline_sell_threshold" in parent_a or "baseline_sell_threshold" in parent_b:
+        keys.append("baseline_sell_threshold")
+    for key in keys:
         child[key] = parent_a[key] if rng.random() < 0.5 else parent_b[key]
     return child
 
@@ -472,6 +574,8 @@ def _mutate(
         child["rebalance_interval_quarters"] = rng.choice(search_space.rebalance_interval_quarters)
     if rng.random() < float(mutation_rate):
         child["allocation_strategy"] = rng.choice(search_space.allocation_strategies)
+    if search_space.baseline_sell_thresholds and rng.random() < float(mutation_rate):
+        child["baseline_sell_threshold"] = rng.choice(search_space.baseline_sell_thresholds)
     return child
 
 
@@ -614,9 +718,13 @@ def _evaluate_individual(
         )
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
+        effective_hyperparameters = _effective_hyperparameters(
+            base_config=base_config,
+            hyperparameters=hyperparameters,
+        )
         evaluation = EvaluationResult(
             run_id=trial_id,
-            hyperparameters=dict(hyperparameters),
+            hyperparameters=effective_hyperparameters,
             objective_metrics={"cagr": None},
             constraint_metrics={"max_drawdown": None},
             diagnostic_metrics={},
@@ -624,7 +732,7 @@ def _evaluate_individual(
                 "run_id": trial_id,
                 "status": "failed",
                 "error": error,
-                "hyperparameters": dict(hyperparameters),
+                "hyperparameters": effective_hyperparameters,
             },
             persisted_artifacts={},
             dynamic_run=None,
@@ -685,6 +793,7 @@ def _study_summary_payload(
     study_id: str,
     search_space: GeneticSearchSpace,
     config: GeneticAlgorithmConfig,
+    execution_plan: dict[str, Any],
     generations_completed: int,
     total_trials_evaluated: int,
     failed_trials: list[GeneticIndividual],
@@ -703,7 +812,7 @@ def _study_summary_payload(
             "run_id": individual.evaluation.run_id,
             "trial_index": int(individual.trial_index),
             "generation": int(individual.generation),
-            "hyperparameters": dict(individual.hyperparameters),
+            "hyperparameters": dict(individual.evaluation.hyperparameters or individual.hyperparameters),
             "search_objectives": dict(individual.search_objectives),
             "objective_metrics": dict(individual.evaluation.objective_metrics),
             "constraint_metrics": dict(individual.evaluation.constraint_metrics),
@@ -718,9 +827,11 @@ def _study_summary_payload(
             "portfolio_sizes": list(search_space.portfolio_sizes),
             "rebalance_interval_quarters": list(search_space.rebalance_interval_quarters),
             "allocation_strategies": list(search_space.allocation_strategies),
+            "baseline_sell_thresholds": list(search_space.baseline_sell_thresholds),
             "combination_count": int(search_space.combination_count()),
         },
         "config": asdict(config),
+        "execution_plan": execution_plan,
         "objective_names": list(objective_names),
         "generations_completed": int(generations_completed),
         "total_trials_evaluated": int(total_trials_evaluated),
@@ -824,13 +935,13 @@ def _generate_winner_full_summaries(
                 "db_path": evaluation.persisted_artifacts["sqlite_db"],
                 "showresults_dir": str(showresults_dir),
                 "summary_json": str(Path(showresults_dir) / "summary.json"),
-                "hyperparameters": dict(individual.hyperparameters),
+                "hyperparameters": dict(evaluation.hyperparameters),
                 "source_trial_run_id": individual.evaluation.run_id,
             }
         except Exception as exc:  # noqa: BLE001
             payload = {
                 "label": label,
-                "hyperparameters": dict(individual.hyperparameters),
+                "hyperparameters": dict(individual.evaluation.hyperparameters or individual.hyperparameters),
                 "source_trial_run_id": individual.evaluation.run_id,
                 "error": f"{type(exc).__name__}: {exc}",
             }
@@ -870,7 +981,11 @@ def run_genetic_algorithm(
     objective_names = _search_objective_names(ga_config)
     strategy = base_config.strategy
     candidate_count = int(strategy.candidate_count) if strategy is not None else None
-    space = (search_space or GeneticSearchSpace()).validated(candidate_count=candidate_count)
+    baseline_sell_enabled = bool(strategy.baseline_sell_enabled) if strategy is not None else False
+    space = (search_space or GeneticSearchSpace()).validated(
+        candidate_count=candidate_count,
+        baseline_sell_enabled=baseline_sell_enabled,
+    )
     study_id = _study_id(space, ga_config)
     search_space_id = hashlib.sha1(
         json.dumps(
@@ -878,6 +993,7 @@ def run_genetic_algorithm(
                 "portfolio_sizes": list(space.portfolio_sizes),
                 "rebalance_interval_quarters": list(space.rebalance_interval_quarters),
                 "allocation_strategies": list(space.allocation_strategies),
+                "baseline_sell_thresholds": list(space.baseline_sell_thresholds),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -910,11 +1026,12 @@ def run_genetic_algorithm(
     evaluation_cache: dict[tuple[int, int, str], GeneticIndividual] = {}
     total_trials = 0
     population_history: list[dict[str, Any]] = []
-    parallel_enabled = _can_parallelize(provider, config=ga_config)
+    execution_plan = _parallel_diagnostics(provider, config=ga_config)
+    parallel_enabled = bool(execution_plan["parallel_enabled"])
     executor: ProcessPoolExecutor | None = None
     if parallel_enabled:
         executor = ProcessPoolExecutor(
-            max_workers=_process_pool_max_workers(ga_config),
+            max_workers=int(execution_plan["effective_max_workers"]),
             mp_context=multiprocessing.get_context(_process_pool_context_name()),
         )
 
@@ -922,7 +1039,7 @@ def run_genetic_algorithm(
         hyperparameter_candidates: list[dict[str, Any]],
         *,
         generation: int,
-    ) -> list[GeneticIndividual]:
+    ) -> list[GeneticIndividual]:  
         nonlocal total_trials
         results: list[GeneticIndividual | None] = [None] * len(hyperparameter_candidates)
         payloads: list[dict[str, Any]] = []
@@ -1161,6 +1278,7 @@ def run_genetic_algorithm(
                 study_id=study_id,
                 search_space=space,
                 config=ga_config,
+                execution_plan=execution_plan,
                 generations_completed=max(int(ga_config.generations), 1),
                 total_trials_evaluated=int(total_trials),
                 failed_trials=failed_trials,
@@ -1192,3 +1310,125 @@ def run_genetic_algorithm(
         study_artifacts=study_artifacts,
         objective_names=objective_names,
     )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the dividend portfolio hyperparameter search with the built-in optimizer."
+    )
+    parser.add_argument("--config", default="config/portfolio.yaml", help="Path to portfolio config")
+    parser.add_argument(
+        "--benchmark",
+        default="sp500",
+        choices=("sp500", "none"),
+        help="Benchmark mode used for evaluation and search objectives.",
+    )
+    parser.add_argument(
+        "--persist-trials",
+        default="none",
+        choices=("none", "summary"),
+        help="Per-trial persistence mode.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=2,
+        help="Process worker count for parallel trial evaluation.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=42,
+        help="Random seed used for candidate ordering and GA operations.",
+    )
+    parser.add_argument(
+        "--study-id",
+        default=None,
+        help="Optional study id override. Default is a UTC timestamp-based id.",
+    )
+    parser.add_argument(
+        "--benchmark-cache-db-path",
+        default=None,
+        help="Optional SQLite path for cached benchmark close history.",
+    )
+    parser.add_argument(
+        "--population-size",
+        type=int,
+        default=None,
+        help="Population size override. Default is exhaustive evaluation of all combinations.",
+    )
+    parser.add_argument(
+        "--generations",
+        type=int,
+        default=1,
+        help="Number of optimizer generations to run.",
+    )
+    parser.add_argument(
+        "--elite-count",
+        type=int,
+        default=0,
+        help="Elite individuals to carry forward each generation.",
+    )
+    parser.add_argument(
+        "--no-winner-full-summaries",
+        action="store_true",
+        help="Skip rerunning best-by-return and best-by-drawdown as full showresults workflows.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_portfolio_config(args.config)
+    strategy = cfg.strategy
+    validated_space = GeneticSearchSpace().validated(
+        candidate_count=(int(strategy.candidate_count) if strategy is not None else None),
+        baseline_sell_enabled=(bool(strategy.baseline_sell_enabled) if strategy is not None else False),
+    )
+    study_id = args.study_id or f"ga_exhaustive_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    population_size = (
+        args.population_size if args.population_size is not None else validated_space.combination_count()
+    )
+    execution_plan = _parallel_diagnostics(None, config=GeneticAlgorithmConfig(max_workers=int(args.max_workers)))
+
+    print("search_space_combinations:", validated_space.combination_count())
+    print("population_size:", int(population_size))
+    print("parallel_enabled:", execution_plan["parallel_enabled"])
+    print("requested_max_workers:", execution_plan["requested_max_workers"])
+    print("effective_max_workers:", execution_plan["effective_max_workers"])
+    print("process_pool_context:", execution_plan["process_pool_context"])
+    if execution_plan["parallel_disable_reason"]:
+        print("parallel_disable_reason:", execution_plan["parallel_disable_reason"])
+
+    result = run_genetic_algorithm(
+        base_config=cfg,
+        search_space=validated_space,
+        config=GeneticAlgorithmConfig(
+            population_size=population_size,
+            generations=int(args.generations),
+            elite_count=int(args.elite_count),
+            random_seed=int(args.random_seed),
+            persist_trials=args.persist_trials,
+            benchmark=args.benchmark,
+            max_workers=int(args.max_workers),
+            study_id=study_id,
+            generate_winner_full_summaries=not args.no_winner_full_summaries,
+        ),
+        benchmark_cache_db_path=args.benchmark_cache_db_path,
+    )
+
+    print("study_id:", result.study_id)
+    print("combinations_tested:", result.total_trials_evaluated)
+    print("failed_trials:", len(result.failed_trials))
+    print("best_by_return:", result.best_by_return.hyperparameters if result.best_by_return else None)
+    print("best_by_drawdown:", result.best_by_drawdown.hyperparameters if result.best_by_drawdown else None)
+    print("pareto_front_size:", len(result.pareto_front))
+    print("study_summary_json:", result.study_artifacts.get("study_summary_json"))
+    print("trial_results_csv:", result.study_artifacts.get("trial_results_csv"))
+    print("population_history_csv:", result.study_artifacts.get("population_history_csv"))
+    print("best_by_return_summary_json:", result.study_artifacts.get("best_by_return_summary_json"))
+    print("best_by_drawdown_summary_json:", result.study_artifacts.get("best_by_drawdown_summary_json"))
+
+
+if __name__ == "__main__":
+    main()

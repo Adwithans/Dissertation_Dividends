@@ -824,10 +824,55 @@ def compute_summary_from_data(
             warnings_out.append(warn)
 
     allocation_strategy = _normalized_allocation_strategy(strategy_cfg)
+    bond_universe_cfg = (
+        strategy_cfg.get("bond_universe", {})
+        if isinstance(strategy_cfg.get("bond_universe", {}), dict)
+        else {}
+    )
+    bond_universe_enabled = bool(bond_universe_cfg.get("enabled", False))
+    bond_universe_mode = str(bond_universe_cfg.get("mode", "treasury_etfs")).strip().lower()
+    bond_universe_rics = [
+        str(ric).strip().upper()
+        for ric in bond_universe_cfg.get("rics", [])
+        if str(ric).strip()
+    ]
+    baseline_sell_enabled = bool(strategy_cfg.get("baseline_sell_enabled", False))
+    baseline_sell_threshold = _safe_float(strategy_cfg.get("baseline_sell_threshold", 0.10))
+    baseline_sell_exits = (
+        trades_df.loc[trades_df.get("reason", pd.Series(dtype=object)).astype(str) == "baseline_sell_exit"].copy()
+        if "reason" in trades_df.columns
+        else pd.DataFrame(columns=trades_df.columns)
+    )
+    baseline_sell_refuge_buys = (
+        trades_df.loc[
+            trades_df.get("reason", pd.Series(dtype=object)).astype(str) == "baseline_sell_refuge_buy"
+        ].copy()
+        if "reason" in trades_df.columns
+        else pd.DataFrame(columns=trades_df.columns)
+    )
+    treasury_refuge_holdings = (
+        held_only.loc[held_only["ric"].astype(str).isin(set(bond_universe_rics))].copy()
+        if bond_universe_rics
+        else pd.DataFrame(columns=held_only.columns)
+    )
+    baseline_sell_event_count = int(len(baseline_sell_exits))
+    treasury_refuge_days = (
+        int(treasury_refuge_holdings["date"].nunique())
+        if not treasury_refuge_holdings.empty and "date" in treasury_refuge_holdings.columns
+        else 0
+    )
+    capital_moved_to_treasuries = (
+        float(baseline_sell_refuge_buys["trade_value"].abs().sum())
+        if "trade_value" in baseline_sell_refuge_buys.columns and not baseline_sell_refuge_buys.empty
+        else 0.0
+    )
     hyperparameters = {
         "portfolio_size": strategy_cfg.get("portfolio_size"),
         "rebalance_interval_quarters": strategy_cfg.get("rebalance_interval_quarters", 1),
         "allocation_strategy": allocation_strategy,
+        "bond_universe_enabled": bond_universe_enabled,
+        "baseline_sell_enabled": baseline_sell_enabled,
+        "baseline_sell_threshold": baseline_sell_threshold,
     }
     objective_metrics = {
         "cagr": float(cagr),
@@ -848,6 +893,8 @@ def compute_summary_from_data(
         "dividend_share_of_total_gain": float(div_share_gain),
         "positive_days": positive_days,
         "negative_days": negative_days,
+        "baseline_sell_event_count": baseline_sell_event_count,
+        "treasury_refuge_days": treasury_refuge_days,
         "quarterly_vs_sp500": _to_jsonable(quarterly_vs_sp500_stats),
     }
     dsr_readiness = {
@@ -956,6 +1003,31 @@ def compute_summary_from_data(
         "constraint_metrics": constraint_metrics,
         "diagnostic_metrics": diagnostic_metrics,
         "dsr_readiness": dsr_readiness,
+        "risk_management": {
+            "bond_universe_enabled": bond_universe_enabled,
+            "bond_universe_mode": bond_universe_mode,
+            "bond_universe_rics": bond_universe_rics,
+            "baseline_sell_enabled": baseline_sell_enabled,
+            "baseline_sell_threshold": baseline_sell_threshold,
+            "baseline_sell_event_count": baseline_sell_event_count,
+            "baseline_sell_trade_days": (
+                int(baseline_sell_exits["date"].nunique())
+                if not baseline_sell_exits.empty and "date" in baseline_sell_exits.columns
+                else 0
+            ),
+            "stopped_positions": (
+                sorted(baseline_sell_exits["ric"].astype(str).unique().tolist())
+                if not baseline_sell_exits.empty and "ric" in baseline_sell_exits.columns
+                else []
+            ),
+            "capital_moved_to_treasuries": capital_moved_to_treasuries,
+            "treasury_refuge_days": treasury_refuge_days,
+            "treasury_refuge_rics": (
+                sorted(treasury_refuge_holdings["ric"].astype(str).unique().tolist())
+                if not treasury_refuge_holdings.empty and "ric" in treasury_refuge_holdings.columns
+                else []
+            ),
+        },
         "comparative_period_stats": {
             "monthly_up_down_counts": {
                 "strategy": strategy_monthly_counts,
@@ -969,6 +1041,11 @@ def compute_summary_from_data(
             "config_reinvest_dividends": config_reinvest,
             "effective_behavior": (
                 "Dividends are credited to cash on pay dates and deployed into holdings at quarterly rebalances."
+                if not baseline_sell_enabled
+                else (
+                    "Dividends are credited to cash on pay dates and deployed into holdings at quarterly "
+                    "rebalances, with baseline-sell exits also routing capital into Treasury ETFs."
+                )
             ),
         },
         "strategy": {
@@ -978,6 +1055,11 @@ def compute_summary_from_data(
             "portfolio_size": strategy_cfg.get("portfolio_size"),
             "rebalance_interval_quarters": strategy_cfg.get("rebalance_interval_quarters", 1),
             "allocation_strategy": allocation_strategy,
+            "bond_universe_enabled": bond_universe_enabled,
+            "bond_universe_mode": bond_universe_mode,
+            "bond_universe_rics": bond_universe_rics,
+            "baseline_sell_enabled": baseline_sell_enabled,
+            "baseline_sell_threshold": baseline_sell_threshold,
             "selection_policy_name": selection_policy_cfg.get("name", "full_refresh"),
             "max_replacements_per_quarter": selection_policy_cfg.get("max_replacements_per_quarter"),
             "selection_policy_rank_metric": selection_policy_cfg.get(

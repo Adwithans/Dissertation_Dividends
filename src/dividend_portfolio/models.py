@@ -46,6 +46,13 @@ class SelectionPolicyConfig:
 
 
 @dataclass(frozen=True)
+class BondUniverseConfig:
+    enabled: bool = False
+    mode: str = "treasury_etfs"
+    rics: tuple[str, ...] = ("IEF.OQ", "TLT.OQ")
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     mode: str = "static"
     universe_scope: str = "sp500"
@@ -66,6 +73,9 @@ class StrategyConfig:
     parquet_enabled: bool = True
     csv_export_enabled: bool = False
     selection_policy: SelectionPolicyConfig = field(default_factory=SelectionPolicyConfig)
+    bond_universe: BondUniverseConfig = field(default_factory=BondUniverseConfig)
+    baseline_sell_enabled: bool = False
+    baseline_sell_threshold: float = 0.10
     experiment_group: str | None = None
 
 

@@ -8,6 +8,7 @@ import yaml
 
 from .models import (
     AssetConfig,
+    BondUniverseConfig,
     PortfolioConfig,
     QuarterlyMetricsConfig,
     RebalanceConfig,
@@ -213,6 +214,23 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
         selection_rank_metric = str(
             selection_policy_raw.get("rank_metric", "quarter_dividend_yield_score")
         ).strip().lower()
+        bond_universe_raw = strategy_raw.get("bond_universe", {})
+        if bond_universe_raw is None:
+            bond_universe_raw = {}
+        if not isinstance(bond_universe_raw, dict):
+            raise ValueError("strategy.bond_universe must be an object")
+        bond_universe_enabled = bool(bond_universe_raw.get("enabled", False))
+        bond_universe_mode = str(bond_universe_raw.get("mode", "treasury_etfs")).strip().lower()
+        bond_universe_rics_raw = bond_universe_raw.get("rics", ["IEF.OQ", "TLT.OQ"])
+        if not isinstance(bond_universe_rics_raw, list):
+            raise ValueError("strategy.bond_universe.rics must be a list")
+        bond_universe_rics = tuple(
+            str(ric).strip().upper()
+            for ric in bond_universe_rics_raw
+            if str(ric).strip()
+        )
+        baseline_sell_enabled = bool(strategy_raw.get("baseline_sell_enabled", False))
+        baseline_sell_threshold = float(strategy_raw.get("baseline_sell_threshold", 0.10))
         experiment_group_raw = strategy_raw.get("experiment_group")
         experiment_group: str | None = None
         if experiment_group_raw is not None:
@@ -269,6 +287,14 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
             raise ValueError(
                 "strategy.selection_policy.name must be one of full_refresh, replace_bottom_n"
             )
+        if bond_universe_mode != "treasury_etfs":
+            raise ValueError("strategy.bond_universe.mode must be 'treasury_etfs'")
+        if bond_universe_enabled and not bond_universe_rics:
+            raise ValueError("strategy.bond_universe.rics must contain at least one RIC when enabled")
+        if baseline_sell_threshold <= 0 or baseline_sell_threshold >= 1:
+            raise ValueError("strategy.baseline_sell_threshold must be > 0 and < 1")
+        if baseline_sell_enabled and not bond_universe_enabled:
+            raise ValueError("strategy.baseline_sell_enabled requires strategy.bond_universe.enabled = true")
         if max_replacements_per_quarter < 0:
             raise ValueError("strategy.selection_policy.max_replacements_per_quarter must be >= 0")
         if max_replacements_per_quarter > portfolio_size:
@@ -304,6 +330,13 @@ def load_portfolio_config(path: str | Path) -> PortfolioConfig:
                 max_replacements_per_quarter=max_replacements_per_quarter,
                 rank_metric=selection_rank_metric,
             ),
+            bond_universe=BondUniverseConfig(
+                enabled=bond_universe_enabled,
+                mode=bond_universe_mode,
+                rics=bond_universe_rics,
+            ),
+            baseline_sell_enabled=baseline_sell_enabled,
+            baseline_sell_threshold=baseline_sell_threshold,
             experiment_group=experiment_group,
         )
 

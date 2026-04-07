@@ -58,8 +58,19 @@ def _build_top100_candidates(
     as_of_date: str,
     lookback_months: int,
     candidate_count: int,
+    supplemental_rics: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    constituents = provider.get_sp500_constituents_as_of(as_of_date)
+    supplemental = [
+        str(ric).strip().upper()
+        for ric in (supplemental_rics or [])
+        if str(ric).strip()
+    ]
+    constituents = [
+        str(ric).strip().upper()
+        for ric in provider.get_sp500_constituents_as_of(as_of_date)
+        if str(ric).strip()
+    ]
+    universe_rics = list(dict.fromkeys(constituents + supplemental))
     payer_start = trailing_lookback_start(as_of_date, lookback_months)
     scan_chunk = int(os.getenv("DIVIDEND_PAYER_SCAN_CHUNK", "75"))
     scan_chunk = max(scan_chunk, 1)
@@ -70,13 +81,15 @@ def _build_top100_candidates(
         "candidate_count_target": int(candidate_count),
         "scan_chunk": int(scan_chunk),
         "constituent_count": int(len(constituents)),
+        "supplemental_universe_count": int(len(supplemental)),
         "market_cap_count": 0,
         "ranked_market_cap_count": 0,
         "dividend_event_count": 0,
         "dividend_payer_count": 0,
+        "supplemental_candidate_count": 0,
         "candidate_count_found": 0,
     }
-    if not constituents:
+    if not universe_rics:
         return (
             pd.DataFrame(columns=["RIC", "MarketCap", "MarketCapDate", "RankByMarketCap"]),
             pd.DataFrame(columns=["RIC", "MarketCap", "MarketCapDate"]),
@@ -84,7 +97,7 @@ def _build_top100_candidates(
             stats,
         )
 
-    market_caps = provider.get_market_cap_snapshot(constituents, as_of_date)
+    market_caps = provider.get_market_cap_snapshot(universe_rics, as_of_date)
     stats["market_cap_count"] = int(len(market_caps))
     if market_caps.empty:
         return (
@@ -125,6 +138,10 @@ def _build_top100_candidates(
             dividend_payers=dividend_payers,
             candidate_count=candidate_count,
         )
+        if not candidates.empty:
+            stats["supplemental_candidate_count"] = int(
+                candidates["RIC"].astype(str).isin(set(supplemental)).sum()
+            )
         if len(candidates) >= candidate_count:
             break
 
@@ -157,6 +174,63 @@ def _strategy_allocation_strategy(strategy: StrategyConfig) -> str:
     if normalized == "normalized_yield_score":
         return "yield_proportional"
     return normalized
+
+
+def _strategy_bond_rics(strategy: StrategyConfig) -> list[str]:
+    if not strategy.bond_universe.enabled:
+        return []
+    return [
+        str(ric).strip().upper()
+        for ric in strategy.bond_universe.rics
+        if str(ric).strip()
+    ]
+
+
+def _selection_from_holdings(holdings_df: pd.DataFrame) -> pd.DataFrame:
+    if holdings_df.empty:
+        return pd.DataFrame(columns=["RIC", "Weight", "RankInPortfolio"])
+    out = holdings_df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["market_value"] = pd.to_numeric(out["market_value"], errors="coerce")
+    out = out.dropna(subset=["date", "ric", "market_value"])
+    if out.empty:
+        return pd.DataFrame(columns=["RIC", "Weight", "RankInPortfolio"])
+    last_date = out["date"].max()
+    last_holdings = out.loc[out["date"] == last_date].copy()
+    last_holdings = last_holdings.loc[last_holdings["market_value"] > 0].copy()
+    if last_holdings.empty:
+        return pd.DataFrame(columns=["RIC", "Weight", "RankInPortfolio"])
+    total_market = float(last_holdings["market_value"].sum())
+    last_holdings["RIC"] = last_holdings["ric"].astype(str)
+    last_holdings = last_holdings.sort_values(["market_value", "RIC"], ascending=[False, True]).reset_index(drop=True)
+    last_holdings["Weight"] = (
+        last_holdings["market_value"] / total_market if total_market > 0 else 1.0 / len(last_holdings)
+    )
+    last_holdings["RankInPortfolio"] = last_holdings.index + 1
+    return last_holdings[["RIC", "Weight", "RankInPortfolio"]]
+
+
+def _pick_refuge_bond(
+    *,
+    bond_rics: list[str],
+    refuge_score_df: pd.DataFrame | None,
+    prices_at_date: pd.Series,
+) -> str | None:
+    available = [
+        ric for ric in bond_rics if ric in prices_at_date.index and pd.notna(prices_at_date.get(ric)) and float(prices_at_date.get(ric)) > 0
+    ]
+    if not available:
+        return None
+    if refuge_score_df is not None and not refuge_score_df.empty:
+        ranked = refuge_score_df.copy()
+        ranked["RIC"] = ranked["RIC"].astype(str)
+        ranked["Score"] = pd.to_numeric(ranked["Score"], errors="coerce")
+        ranked = ranked.dropna(subset=["RIC", "Score"])
+        ranked = ranked.loc[ranked["RIC"].isin(available)]
+        ranked = ranked.sort_values(["Score", "RIC"], ascending=[False, True]).reset_index(drop=True)
+        if not ranked.empty:
+            return str(ranked.iloc[0]["RIC"])
+    return sorted(available)[0]
 
 
 def _selection_template(selection: pd.DataFrame) -> pd.DataFrame:
@@ -456,6 +530,11 @@ def _simulate_quarter(
     price_long: pd.DataFrame | None = None,
     div_long: pd.DataFrame | None = None,
     bid_ask_long: pd.DataFrame | None = None,
+    prev_entry_price_reference: dict[str, float] | None = None,
+    baseline_sell_enabled: bool = False,
+    baseline_sell_threshold: float = 0.10,
+    bond_rics: list[str] | None = None,
+    refuge_score_df: pd.DataFrame | None = None,
 ) -> tuple[
     dict[str, float],
     float,
@@ -466,11 +545,15 @@ def _simulate_quarter(
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    dict[str, float],
 ]:
+    eps = 1e-12
     selection_rics = selection["RIC"].astype(str).tolist()
     target_weights = dict(zip(selection_rics, selection["Weight"].astype(float), strict=False))
-    prior_rics = list(prev_shares.keys())
-    universe_for_prices = sorted(set(selection_rics).union(prior_rics))
+    bond_rics = [str(ric).strip().upper() for ric in (bond_rics or []) if str(ric).strip()]
+    bond_set = set(bond_rics)
+    prior_rics = [str(ric) for ric, shares in prev_shares.items() if abs(float(shares)) > eps]
+    universe_for_prices = sorted(set(selection_rics).union(prior_rics).union(bond_set))
 
     if price_long is None:
         if provider is None:
@@ -489,46 +572,73 @@ def _simulate_quarter(
     if len(quarter_dates) == 0:
         raise ValueError(f"No tradable dates in quarter window for {quarter_label}")
 
+    if bid_ask_long is None:
+        if provider is None:
+            bid_ask_long = pd.DataFrame(columns=["Date", "RIC", "BID", "ASK"])
+        else:
+            bid_ask_long = provider.get_bid_ask_history(universe_for_prices, quarter_start, quarter_end)
+    else:
+        bid_ask_long = bid_ask_long.loc[bid_ask_long["RIC"].astype(str).isin(universe_for_prices)].copy()
+    bid_pivot, ask_pivot = _pivot_bid_ask(bid_ask_long)
+    if not bid_pivot.empty:
+        bid_pivot = bid_pivot.ffill()
+    if not ask_pivot.empty:
+        ask_pivot = ask_pivot.ffill()
+
+    if div_long is None:
+        if provider is None:
+            raise ValueError("Either provider or div_long must be supplied to _simulate_quarter")
+        div_long = provider.get_dividend_events(universe_for_prices, quarter_start, quarter_end)
+    else:
+        div_long = div_long.loc[div_long["RIC"].astype(str).isin(universe_for_prices)].copy()
+    if div_long.empty:
+        div_map: dict[tuple[pd.Timestamp, str], float] = {}
+    else:
+        div = div_long.copy()
+        div["Date"] = pd.to_datetime(div["Date"], errors="coerce")
+        div["Dividend"] = pd.to_numeric(div["Dividend"], errors="coerce")
+        div = div.dropna(subset=["Date", "RIC", "Dividend"])
+        div = div.groupby(["Date", "RIC"], as_index=False)["Dividend"].sum()
+        div_map = {(r.Date, str(r.RIC)): float(r.Dividend) for r in div.itertuples(index=False)}
+
     rebalance_date: pd.Timestamp | None = first_valuation_date if do_rebalance else None
     trades: list[dict[str, Any]] = []
-    transaction_cost_on_rebalance = 0.0
-    commission_cost_on_rebalance = 0.0
-    slippage_cost_on_rebalance = 0.0
-    spread_cost_on_rebalance = 0.0
+    transaction_cost_cumulative = float(prev_transaction_cost_cumulative)
+    cash = float(prev_cash)
+    if abs(cash) < 1e-10:
+        cash = 0.0
+    new_shares = {
+        str(ric): float(shares)
+        for ric, shares in prev_shares.items()
+        if abs(float(shares)) > eps
+    }
+    entry_price_reference = {
+        str(ric): float(price_ref)
+        for ric, price_ref in (prev_entry_price_reference or {}).items()
+        if str(ric) not in bond_set and abs(float(new_shares.get(str(ric), 0.0))) > eps
+    }
 
     if do_rebalance:
         prices_at_rebalance = price_pivot.loc[first_valuation_date]
-        if bid_ask_long is None:
-            if provider is None:
-                bid_ask_long = pd.DataFrame(columns=["Date", "RIC", "BID", "ASK"])
-            else:
-                bid_ask_long = provider.get_bid_ask_history(universe_for_prices, quarter_start, quarter_end)
-        else:
-            bid_ask_long = bid_ask_long.loc[bid_ask_long["RIC"].astype(str).isin(universe_for_prices)].copy()
-        bid_pivot, ask_pivot = _pivot_bid_ask(bid_ask_long)
-        if not bid_pivot.empty:
-            bid_pivot = bid_pivot.ffill()
-        if not ask_pivot.empty:
-            ask_pivot = ask_pivot.ffill()
-
-        all_trade_rics = sorted(set(prior_rics).union(selection_rics))
+        all_trade_rics = sorted(set(prior_rics).union(selection_rics).union(bond_set))
         prices_by_ric: dict[str, float] = {}
         bids_by_ric: dict[str, float] = {}
         asks_by_ric: dict[str, float] = {}
         for ric in all_trade_rics:
             px = float(prices_at_rebalance.get(ric, float("nan")))
-            if not pd.isna(px) and px > 0:
-                prices_by_ric[ric] = px
-                bids_by_ric[ric] = (
-                    float(bid_pivot.loc[first_valuation_date, ric])
-                    if (not bid_pivot.empty and first_valuation_date in bid_pivot.index and ric in bid_pivot.columns)
-                    else float("nan")
-                )
-                asks_by_ric[ric] = (
-                    float(ask_pivot.loc[first_valuation_date, ric])
-                    if (not ask_pivot.empty and first_valuation_date in ask_pivot.index and ric in ask_pivot.columns)
-                    else float("nan")
-                )
+            if pd.isna(px) or px <= 0:
+                continue
+            prices_by_ric[ric] = px
+            bids_by_ric[ric] = (
+                float(bid_pivot.loc[first_valuation_date, ric])
+                if (not bid_pivot.empty and first_valuation_date in bid_pivot.index and ric in bid_pivot.columns)
+                else float("nan")
+            )
+            asks_by_ric[ric] = (
+                float(ask_pivot.loc[first_valuation_date, ric])
+                if (not ask_pivot.empty and first_valuation_date in ask_pivot.index and ric in ask_pivot.columns)
+                else float("nan")
+            )
 
         rebalance_result = rebalance_to_target_with_costs(
             prices_by_ric=prices_by_ric,
@@ -542,10 +652,14 @@ def _simulate_quarter(
         cash = float(rebalance_result.cash_after)
         if abs(cash) < 1e-10:
             cash = 0.0
-        new_shares = {ric: float(rebalance_result.shares_after.get(ric, 0.0)) for ric in selection_rics}
+        new_shares = {
+            str(ric): float(shares)
+            for ric, shares in rebalance_result.shares_after.items()
+            if abs(float(shares)) > eps
+        }
 
         for row in rebalance_result.trade_rows:
-            if abs(float(row["trade_shares"])) <= 1e-12:
+            if abs(float(row["trade_shares"])) <= eps:
                 continue
             trades.append(
                 {
@@ -571,54 +685,173 @@ def _simulate_quarter(
                     "reason": "quarterly_rotation",
                 }
             )
-        transaction_cost_on_rebalance = float(rebalance_result.transaction_cost_total)
-        commission_cost_on_rebalance = float(rebalance_result.commission_cost_total)
-        slippage_cost_on_rebalance = float(rebalance_result.slippage_cost_total)
-        spread_cost_on_rebalance = float(rebalance_result.spread_cost_total)
-    else:
-        cash = float(prev_cash)
-        if abs(cash) < 1e-10:
-            cash = 0.0
-        new_shares = {ric: float(prev_shares.get(ric, 0.0)) for ric in selection_rics}
-        if bid_ask_long is None:
-            bid_ask_long = pd.DataFrame(columns=["Date", "RIC", "BID", "ASK"])
-        else:
-            bid_ask_long = bid_ask_long.loc[bid_ask_long["RIC"].astype(str).isin(universe_for_prices)].copy()
 
-    if div_long is None:
-        if provider is None:
-            raise ValueError("Either provider or div_long must be supplied to _simulate_quarter")
-        div_long = provider.get_dividend_events(selection_rics, quarter_start, quarter_end)
-    else:
-        div_long = div_long.loc[div_long["RIC"].astype(str).isin(selection_rics)].copy()
-    if div_long.empty:
-        div_map = {}
-    else:
-        div = div_long.copy()
-        div["Date"] = pd.to_datetime(div["Date"], errors="coerce")
-        div["Dividend"] = pd.to_numeric(div["Dividend"], errors="coerce")
-        div = div.dropna(subset=["Date", "RIC", "Dividend"])
-        div = div.groupby(["Date", "RIC"], as_index=False)["Dividend"].sum()
-        div_map = {(r.Date, r.RIC): float(r.Dividend) for r in div.itertuples(index=False)}
+        refreshed_entry_refs: dict[str, float] = {}
+        for ric, shares_after in new_shares.items():
+            if ric in bond_set or shares_after <= eps:
+                continue
+            prev_qty = float(prev_shares.get(ric, 0.0))
+            if prev_qty > eps and ric in entry_price_reference:
+                refreshed_entry_refs[ric] = float(entry_price_reference[ric])
+            else:
+                refreshed_entry_refs[ric] = float(prices_at_rebalance.get(ric))
+        entry_price_reference = refreshed_entry_refs
 
     holdings_rows: list[dict[str, Any]] = []
     portfolio_rows: list[dict[str, Any]] = []
-    transaction_cost_cumulative = float(prev_transaction_cost_cumulative)
+    scheduled_stop_sales: set[str] = set()
 
-    for dt in quarter_dates:
+    for idx, dt in enumerate(quarter_dates):
         dividend_cash_daily = 0.0
         transaction_cost_daily = 0.0
         commission_cost_daily = 0.0
         slippage_cost_daily = 0.0
         spread_cost_daily = 0.0
+
         if rebalance_date is not None and dt == rebalance_date:
-            transaction_cost_daily = transaction_cost_on_rebalance
-            commission_cost_daily = commission_cost_on_rebalance
-            slippage_cost_daily = slippage_cost_on_rebalance
-            spread_cost_daily = spread_cost_on_rebalance
+            rebalance_tx = [
+                trade
+                for trade in trades
+                if trade["date"] == dt.date().isoformat() and trade["reason"] == "quarterly_rotation"
+            ]
+            transaction_cost_daily += float(sum(float(row["total_transaction_cost"]) for row in rebalance_tx))
+            commission_cost_daily += float(sum(float(row["commission_cost"]) for row in rebalance_tx))
+            slippage_cost_daily += float(sum(float(row["slippage_cost"]) for row in rebalance_tx))
+            spread_cost_daily += float(sum(float(row["spread_cost"]) for row in rebalance_tx))
             transaction_cost_cumulative += transaction_cost_daily
+
+        if baseline_sell_enabled and scheduled_stop_sales:
+            prices_at_stop = price_pivot.loc[dt]
+            refuge_bond = _pick_refuge_bond(
+                bond_rics=bond_rics,
+                refuge_score_df=refuge_score_df,
+                prices_at_date=prices_at_stop,
+            )
+            if refuge_bond is None and scheduled_stop_sales:
+                raise ValueError(
+                    "Baseline sell triggered but no Treasury ETF refuge asset had usable pricing on "
+                    f"{dt.date().isoformat()}."
+                )
+            if refuge_bond is not None:
+                active_rics = sorted(
+                    {
+                        ric
+                        for ric, shares in new_shares.items()
+                        if abs(float(shares)) > eps and ric in price_pivot.columns
+                    }.union({refuge_bond})
+                )
+                current_market = {
+                    ric: float(new_shares.get(ric, 0.0)) * float(prices_at_stop.get(ric, 0.0))
+                    for ric in active_rics
+                    if not pd.isna(prices_at_stop.get(ric)) and float(prices_at_stop.get(ric, 0.0)) > 0
+                }
+                stop_rics = [
+                    ric
+                    for ric in sorted(scheduled_stop_sales)
+                    if abs(float(new_shares.get(ric, 0.0))) > eps and ric in current_market
+                ]
+                if stop_rics:
+                    total_before = float(cash + sum(current_market.values()))
+                    target_values = dict(current_market)
+                    stop_value = 0.0
+                    for ric in stop_rics:
+                        stop_value += float(target_values.get(ric, 0.0))
+                        target_values[ric] = 0.0
+                    target_values[refuge_bond] = float(target_values.get(refuge_bond, 0.0)) + stop_value
+                    stop_target_weights = (
+                        {
+                            ric: float(value) / total_before
+                            for ric, value in target_values.items()
+                            if total_before > 0 and float(value) > 0
+                        }
+                        if total_before > 0
+                        else {}
+                    )
+                    prices_by_ric = {ric: float(prices_at_stop.get(ric)) for ric in current_market}
+                    bids_by_ric = {
+                        ric: (
+                            float(bid_pivot.loc[dt, ric])
+                            if (not bid_pivot.empty and dt in bid_pivot.index and ric in bid_pivot.columns)
+                            else float("nan")
+                        )
+                        for ric in prices_by_ric
+                    }
+                    asks_by_ric = {
+                        ric: (
+                            float(ask_pivot.loc[dt, ric])
+                            if (not ask_pivot.empty and dt in ask_pivot.index and ric in ask_pivot.columns)
+                            else float("nan")
+                        )
+                        for ric in prices_by_ric
+                    }
+                    stop_result = rebalance_to_target_with_costs(
+                        prices_by_ric=prices_by_ric,
+                        shares_by_ric={ric: float(new_shares.get(ric, 0.0)) for ric in prices_by_ric},
+                        portfolio_cash=float(cash),
+                        target_weights=stop_target_weights,
+                        tx=transaction_costs,
+                        bid_by_ric=bids_by_ric,
+                        ask_by_ric=asks_by_ric,
+                    )
+                    cash = float(stop_result.cash_after)
+                    if abs(cash) < 1e-10:
+                        cash = 0.0
+                    new_shares = {
+                        str(ric): float(shares)
+                        for ric, shares in stop_result.shares_after.items()
+                        if abs(float(shares)) > eps
+                    }
+                    transaction_cost_daily += float(stop_result.transaction_cost_total)
+                    commission_cost_daily += float(stop_result.commission_cost_total)
+                    slippage_cost_daily += float(stop_result.slippage_cost_total)
+                    spread_cost_daily += float(stop_result.spread_cost_total)
+                    transaction_cost_cumulative += float(stop_result.transaction_cost_total)
+                    for ric in stop_rics:
+                        entry_price_reference.pop(ric, None)
+                    for row in stop_result.trade_rows:
+                        trade_shares = float(row["trade_shares"])
+                        if abs(trade_shares) <= eps:
+                            continue
+                        ric = str(row["ric"])
+                        if ric in stop_rics and trade_shares < 0:
+                            reason = "baseline_sell_exit"
+                        elif ric == refuge_bond and trade_shares > 0:
+                            reason = "baseline_sell_refuge_buy"
+                        else:
+                            reason = "baseline_sell_rebalance"
+                        trades.append(
+                            {
+                                "run_id": run_id,
+                                "date": dt.date().isoformat(),
+                                "quarter": quarter_label,
+                                "ric": ric,
+                                "price": float(row["reference_price"]),
+                                "trade_shares": trade_shares,
+                                "trade_value": float(row["trade_value"]),
+                                "reference_price": float(row["reference_price"]),
+                                "execution_price": float(row["execution_price"]),
+                                "bid_price": float(row["bid_price"]),
+                                "ask_price": float(row["ask_price"]),
+                                "gross_notional": float(row["gross_notional"]),
+                                "spread_bps_used": float(row["spread_bps_used"]),
+                                "slippage_bps_used": float(row["slippage_bps_used"]),
+                                "commission_cost": float(row["commission_cost"]),
+                                "slippage_cost": float(row["slippage_cost"]),
+                                "spread_cost": float(row["spread_cost"]),
+                                "total_transaction_cost": float(row["total_transaction_cost"]),
+                                "net_cash_flow": float(row["net_cash_flow"]),
+                                "reason": reason,
+                            }
+                        )
+                    scheduled_stop_sales = set()
+
+        active_rics = [
+            ric
+            for ric, shares in sorted(new_shares.items())
+            if abs(float(shares)) > eps and ric in price_pivot.columns and not pd.isna(price_pivot.loc[dt, ric])
+        ]
         market_by_ric: dict[str, float] = {}
-        for ric in selection_rics:
+        for ric in active_rics:
             px = float(price_pivot.loc[dt, ric])
             shares = float(new_shares.get(ric, 0.0))
             div_ps = float(div_map.get((dt, ric), 0.0))
@@ -631,8 +864,9 @@ def _simulate_quarter(
         portfolio_market = float(sum(market_by_ric.values()))
         portfolio_total = portfolio_market + cash
         portfolio_total_gross = portfolio_total + transaction_cost_cumulative
-        for ric in selection_rics:
-            mv = market_by_ric[ric]
+
+        for ric in active_rics:
+            mv = float(market_by_ric.get(ric, 0.0))
             w = mv / portfolio_total if portfolio_total > 0 else 0.0
             holdings_rows.append(
                 {
@@ -669,9 +903,27 @@ def _simulate_quarter(
             }
         )
 
+        if baseline_sell_enabled and idx < len(quarter_dates) - 1:
+            next_scheduled = set()
+            for ric in active_rics:
+                if ric in bond_set:
+                    continue
+                reference_price = float(entry_price_reference.get(ric, 0.0))
+                if reference_price <= 0:
+                    continue
+                px = float(price_pivot.loc[dt, ric])
+                if px <= reference_price * (1.0 - float(baseline_sell_threshold)):
+                    next_scheduled.add(ric)
+            scheduled_stop_sales.update(next_scheduled)
+
     holdings_df = pd.DataFrame(holdings_rows)
     portfolio_df = pd.DataFrame(portfolio_rows)
     trades_df = pd.DataFrame(trades)
+    entry_price_reference = {
+        ric: float(price_ref)
+        for ric, price_ref in entry_price_reference.items()
+        if ric not in bond_set and abs(float(new_shares.get(ric, 0.0))) > eps
+    }
     return (
         new_shares,
         cash,
@@ -682,6 +934,7 @@ def _simulate_quarter(
         price_long,
         div_long,
         bid_ask_long,
+        entry_price_reference,
     )
 
 
@@ -705,6 +958,7 @@ def run_dynamic_rotation(
 ) -> DynamicRunResult:
     strategy = _strategy_or_default(config)
     allocation_strategy = _strategy_allocation_strategy(strategy)
+    bond_rics = _strategy_bond_rics(strategy)
     logger = get_logger("dividend_portfolio.strategy.engine")
 
     run_id = run_id or utc_now_id()
@@ -744,23 +998,29 @@ def run_dynamic_rotation(
         as_of_date=first_start,
         lookback_months=strategy.dividend_payer_lookback_months,
         candidate_count=strategy.candidate_count,
+        supplemental_rics=bond_rics,
     )
-    if len(candidates) < strategy.portfolio_size:
+    initial_candidates = candidates.loc[~candidates["RIC"].astype(str).isin(set(bond_rics))].copy()
+    if len(initial_candidates) < strategy.portfolio_size:
         raise ValueError(
             "Initial candidate set too small "
-            f"({len(candidates)}) for portfolio_size={strategy.portfolio_size}. "
+            f"({len(initial_candidates)}) for portfolio_size={strategy.portfolio_size}. "
             f"Diagnostics: {candidate_stats}"
         )
     pending_selection = PendingSelection(
-        selection=_selection_template(select_initial_portfolio_by_market_cap(candidates, strategy.portfolio_size)),
+        selection=_selection_template(
+            select_initial_portfolio_by_market_cap(initial_candidates, strategy.portfolio_size)
+        ),
         source="initial_market_cap",
         weight_strategy="fixed",
     )
 
     shares: dict[str, float] = {}
+    entry_price_reference: dict[str, float] = {}
     cash = float(config.initial_capital)
     transaction_cost_cumulative = 0.0
     rebalance_interval_quarters = max(int(strategy.rebalance_interval_quarters), 1)
+    latest_completed_scores = pd.DataFrame(columns=["RIC", "Score"])
 
     for i, (quarter_label, q_start, q_end) in enumerate(quarters):
         logger.info("Processing %s (%s..%s)", quarter_label, q_start, q_end)
@@ -770,6 +1030,7 @@ def run_dynamic_rotation(
                 as_of_date=q_start,
                 lookback_months=strategy.dividend_payer_lookback_months,
                 candidate_count=strategy.candidate_count,
+                supplemental_rics=bond_rics,
             )
             if candidates.empty:
                 raise ValueError(
@@ -809,13 +1070,26 @@ def run_dynamic_rotation(
         current_selection = current_selection[["RIC", "Weight", "RankInPortfolio"]].copy()
         current_rics = current_selection["RIC"].astype(str).tolist()
         candidate_rics = candidates["RIC"].astype(str).tolist()
-        quarter_fetch_rics = sorted(set(candidate_rics).union(current_rics).union(set(shares.keys())))
+        quarter_fetch_rics = sorted(
+            set(candidate_rics).union(current_rics).union(set(shares.keys())).union(set(bond_rics))
+        )
         should_rebalance_this_quarter = (i % rebalance_interval_quarters) == 0
 
         # Fetch once per quarter for all required names, then reuse for simulation and scoring.
         quarter_prices_all = provider.get_close_history(quarter_fetch_rics, q_start, q_end)
         quarter_divs_all = provider.get_dividend_events(quarter_fetch_rics, q_start, q_end)
         quarter_bid_ask_all = provider.get_bid_ask_history(quarter_fetch_rics, q_start, q_end)
+        if strategy.baseline_sell_enabled:
+            available_bond_prices = (
+                set(quarter_prices_all["RIC"].dropna().astype(str).tolist())
+                if not quarter_prices_all.empty and "RIC" in quarter_prices_all.columns
+                else set()
+            )
+            if bond_rics and not any(ric in available_bond_prices for ric in bond_rics):
+                raise ValueError(
+                    "Baseline sell is enabled but no Treasury ETF close history was available for "
+                    f"{quarter_label}. Required one of {bond_rics!r}."
+                )
         parquet.write_prices(quarter_prices_all, quarter_label)
         parquet.write_dividends(quarter_divs_all, quarter_label)
         parquet.write_bid_ask(quarter_bid_ask_all, quarter_label)
@@ -830,6 +1104,7 @@ def run_dynamic_rotation(
             _prices_selected,
             _dividends_selected,
             _bid_ask_selected,
+            entry_price_reference,
         ) = _simulate_quarter(
             run_id=run_id,
             quarter_label=quarter_label,
@@ -837,6 +1112,7 @@ def run_dynamic_rotation(
             quarter_end=q_end,
             selection=current_selection,
             prev_shares=shares,
+            prev_entry_price_reference=entry_price_reference,
             prev_cash=cash,
             transaction_costs=config.transaction_costs,
             prev_transaction_cost_cumulative=transaction_cost_cumulative,
@@ -845,6 +1121,10 @@ def run_dynamic_rotation(
             price_long=quarter_prices_all,
             div_long=quarter_divs_all,
             bid_ask_long=quarter_bid_ask_all,
+            baseline_sell_enabled=bool(strategy.baseline_sell_enabled),
+            baseline_sell_threshold=float(strategy.baseline_sell_threshold),
+            bond_rics=bond_rics,
+            refuge_score_df=latest_completed_scores,
         )
         # Selected slices are included in quarter-wide sidecar snapshots above.
 
@@ -883,6 +1163,8 @@ def run_dynamic_rotation(
             store.upsert_target_weights(weights_out)
         weight_rows.append(weights_out)
 
+        end_of_quarter_selection = _selection_from_holdings(holdings_df)
+
         score_prices = quarter_prices_all.loc[quarter_prices_all["RIC"].astype(str).isin(candidate_rics)].copy()
         score_divs = quarter_divs_all.loc[quarter_divs_all["RIC"].astype(str).isin(candidate_rics)].copy()
         candidate_score_df = compute_quarter_dividend_yield_scores(
@@ -920,12 +1202,13 @@ def run_dynamic_rotation(
         if store is not None:
             store.upsert_quarter_scores(score_df_out)
         score_rows.append(score_df_out)
+        latest_completed_scores = candidate_score_df[["RIC", "Score"]].copy()
 
         should_update_next_selection = ((i + 1) % rebalance_interval_quarters) == 0
         if should_update_next_selection:
             selection_scores = candidate_score_df[["RIC", "Score"]].copy()
             if strategy.selection_policy.name == "replace_bottom_n":
-                policy_rics = sorted(set(candidate_rics).union(set(current_rics)))
+                policy_rics = sorted(set(candidate_rics).union(set(end_of_quarter_selection["RIC"].astype(str).tolist())))
                 policy_prices = quarter_prices_all.loc[quarter_prices_all["RIC"].astype(str).isin(policy_rics)].copy()
                 policy_divs = quarter_divs_all.loc[quarter_divs_all["RIC"].astype(str).isin(policy_rics)].copy()
                 policy_scores = compute_quarter_dividend_yield_scores(
@@ -939,7 +1222,7 @@ def run_dynamic_rotation(
                 strategy=strategy,
                 score_df=selection_scores,
                 candidates=candidates,
-                current_selection=current_selection,
+                current_selection=end_of_quarter_selection,
             )
             pending_selection = PendingSelection(
                 selection=_selection_template(next_selection),
@@ -948,7 +1231,7 @@ def run_dynamic_rotation(
             )
         else:
             pending_selection = PendingSelection(
-                selection=_selection_template(current_selection),
+                selection=_selection_template(end_of_quarter_selection),
                 source="carry_forward_no_rebalance",
                 weight_strategy="fixed",
             )

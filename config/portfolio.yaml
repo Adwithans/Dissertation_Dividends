@@ -36,6 +36,14 @@ strategy:
     name: replace_bottom_n
     max_replacements_per_quarter: 12
     rank_metric: quarter_dividend_yield_score
+  bond_universe:
+    enabled: true
+    mode: treasury_etfs
+    rics:
+      - IEF.OQ
+      - TLT.OQ
+  baseline_sell_enabled: true
+  baseline_sell_threshold: 0.10
   experiment_group: realloc_compare
 
 # change the number of times we rebalance (not quarterly)

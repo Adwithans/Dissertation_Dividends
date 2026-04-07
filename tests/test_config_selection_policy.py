@@ -388,3 +388,78 @@ strategy:
     )
     with pytest.raises(ValueError, match="conflicts with legacy"):
         _ = load_portfolio_config(cfg_path)
+
+
+def test_load_config_bond_universe_and_baseline_sell_default_to_disabled(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "portfolio.yaml",
+        """
+base_currency: USD
+initial_capital: 1000000
+start_date: 2024-01-01
+end_date: 2024-12-31
+reinvest_dividends: false
+auto_align_splits: true
+use_cum_factor: true
+risk_free_rate: 0.0
+rebalancing:
+  enabled: true
+  frequency: quarterly
+  trigger: first_trading_day_after_quarter_end
+  drift_tolerance: 0.0
+quarterly_metrics:
+  enabled: true
+  dividend_return_basis: quarter_start_market_value
+strategy:
+  mode: dynamic_100_25
+  universe_scope: sp500
+  candidate_count: 100
+  portfolio_size: 25
+  sqlite_path: data/store/portfolio_100.sqlite
+  parquet_dir: data/store/parquet
+  parquet_enabled: false
+  csv_export_enabled: false
+""".strip(),
+    )
+    cfg = load_portfolio_config(cfg_path)
+    assert cfg.strategy is not None
+    assert cfg.strategy.bond_universe.enabled is False
+    assert cfg.strategy.baseline_sell_enabled is False
+    assert cfg.strategy.baseline_sell_threshold == pytest.approx(0.10)
+    assert cfg.strategy.bond_universe.rics == ("IEF.OQ", "TLT.OQ")
+
+
+def test_load_config_rejects_baseline_sell_without_bond_universe(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "portfolio.yaml",
+        """
+base_currency: USD
+initial_capital: 1000000
+start_date: 2024-01-01
+end_date: 2024-12-31
+reinvest_dividends: false
+auto_align_splits: true
+use_cum_factor: true
+risk_free_rate: 0.0
+rebalancing:
+  enabled: true
+  frequency: quarterly
+  trigger: first_trading_day_after_quarter_end
+  drift_tolerance: 0.0
+quarterly_metrics:
+  enabled: true
+  dividend_return_basis: quarter_start_market_value
+strategy:
+  mode: dynamic_100_25
+  universe_scope: sp500
+  candidate_count: 100
+  portfolio_size: 25
+  baseline_sell_enabled: true
+  sqlite_path: data/store/portfolio_100.sqlite
+  parquet_dir: data/store/parquet
+  parquet_enabled: false
+  csv_export_enabled: false
+""".strip(),
+    )
+    with pytest.raises(ValueError, match="baseline_sell_enabled requires"):
+        _ = load_portfolio_config(cfg_path)

@@ -170,6 +170,13 @@ def test_compute_summary_from_data_key_outputs() -> None:
                 "candidate_count": 100,
                 "portfolio_size": 25,
                 "rebalance_interval_quarters": 2,
+                "bond_universe": {
+                    "enabled": True,
+                    "mode": "treasury_etfs",
+                    "rics": ["IEF.OQ", "TLT.OQ"],
+                },
+                "baseline_sell_enabled": True,
+                "baseline_sell_threshold": 0.1,
                 "selection_policy": {
                     "name": "replace_bottom_n",
                     "max_replacements_per_quarter": 10,
@@ -227,17 +234,29 @@ def test_compute_summary_from_data_key_outputs() -> None:
     assert summary["hyperparameters"]["portfolio_size"] == 25
     assert summary["hyperparameters"]["rebalance_interval_quarters"] == 2
     assert summary["hyperparameters"]["allocation_strategy"] == "yield_proportional"
+    assert summary["hyperparameters"]["bond_universe_enabled"] is True
+    assert summary["hyperparameters"]["baseline_sell_enabled"] is True
+    assert summary["hyperparameters"]["baseline_sell_threshold"] == 0.1
     assert "objective_metrics" in summary
     assert "constraint_metrics" in summary
     assert "diagnostic_metrics" in summary
     assert summary["objective_metrics"]["cagr"] == summary["portfolio_metrics"]["cagr"]
     assert summary["constraint_metrics"]["max_drawdown"] == summary["portfolio_metrics"]["max_drawdown"]
     assert summary["diagnostic_metrics"]["positive_days"] == summary["portfolio_metrics"]["positive_days"]
+    assert summary["diagnostic_metrics"]["baseline_sell_event_count"] == 0
     assert summary["dsr_readiness"]["ready_for_deflated_sharpe"] is False
+    assert summary["risk_management"]["bond_universe_enabled"] is True
+    assert summary["risk_management"]["baseline_sell_enabled"] is True
+    assert summary["risk_management"]["baseline_sell_threshold"] == 0.1
+    assert summary["risk_management"]["baseline_sell_event_count"] == 0
+    assert summary["risk_management"]["treasury_refuge_days"] == 0
     assert summary["strategy"]["selection_policy_name"] == "replace_bottom_n"
     assert summary["strategy"]["max_replacements_per_quarter"] == 10
     assert summary["strategy"]["rebalance_interval_quarters"] == 2
     assert summary["strategy"]["allocation_strategy"] == "yield_proportional"
+    assert summary["strategy"]["bond_universe_enabled"] is True
+    assert summary["strategy"]["baseline_sell_enabled"] is True
+    assert summary["strategy"]["baseline_sell_threshold"] == 0.1
     assert summary["strategy"]["experiment_group"] == "alt_reallocations"
 
 
